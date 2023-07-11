@@ -1,0 +1,8 @@
+bismark_methylation_extractor DKO_data/mapped/SLX-20416.SXTA01.HG7FNDRX2.s_1.r_1_val_1_bismark_bt2_pe.mqual_ge10.bam --mbias_only -p --merge_non_CpG --parallel 4 --comprehensive --gzip -o DKO_data/mbias
+bismark_methylation_extractor DKO_data/mapped/SLX-20416.SXTB01.HG7FNDRX2.s_1.r_1_val_1_bismark_bt2_pe.mqual_ge10.bam --mbias_only -p --merge_non_CpG --parallel 4 --comprehensive --gzip -o DKO_data/mbias
+bismark_methylation_extractor DKO_data/mapped/SLX-20416.SXTC01.HG7FNDRX2.s_1.r_1_val_1_bismark_bt2_pe.mqual_ge10.bam --mbias_only -p --merge_non_CpG --parallel 4 --comprehensive --gzip -o DKO_data/mbias
+bismark_methylation_extractor DKO_data/mapped/SLX-20416.SXTD01.HG7FNDRX2.s_1.r_1_val_1_bismark_bt2_pe.mqual_ge10.bam --mbias_only -p --merge_non_CpG --parallel 4 --comprehensive --gzip -o DKO_data/mbias
+bismark_methylation_extractor DKO_data/mapped/SLX-20416.SXTE01.HG7FNDRX2.s_1.r_1_val_1_bismark_bt2_pe.mqual_ge10.bam --mbias_only -p --merge_non_CpG --parallel 4 --comprehensive --gzip -o DKO_data/mbias
+bismark_methylation_extractor DKO_data/mapped/SLX-20416.SXTF01.HG7FNDRX2.s_1.r_1_val_1_bismark_bt2_pe.mqual_ge10.bam --mbias_only -p --merge_non_CpG --parallel 4 --comprehensive --gzip -o DKO_data/mbias
+bismark_methylation_extractor DKO_data/mapped/SLX-20416.SXTG01.HG7FNDRX2.s_1.r_1_val_1_bismark_bt2_pe.mqual_ge10.bam --mbias_only -p --merge_non_CpG --parallel 4 --comprehensive --gzip -o DKO_data/mbias
+bismark_methylation_extractor DKO_data/mapped/SLX-20416.SXTH01.HG7FNDRX2.s_1.r_1_val_1_bismark_bt2_pe.mqual_ge10.bam --mbias_only -p --merge_non_CpG --parallel 4 --comprehensive --gzip -o DKO_data/mbias

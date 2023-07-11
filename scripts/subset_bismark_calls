@@ -1,0 +1,7 @@
+#!/bin/bash
+inf=$1
+catex=cat
+[[ "$inf" =~ .*.gz$ ]] && catex=zcat
+
+$catex $inf | awk -v chr=$2 -v st=$3 -v en=$4 'NR>1 && $3==chr && $4 >= st && $4 <= (en+1)'
+

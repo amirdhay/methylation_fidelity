@@ -1,0 +1,8 @@
+bismark --multicore 2 /data/genomes/mm10/ -o DKO_data/mapped -1 DKO_data/fastq/trimmed/SLX-20416.SXTA01.HG7FNDRX2.s_1.r_1_val_1.fq.gz -2 DKO_data/fastq/trimmed/SLX-20416.SXTA01.HG7FNDRX2.s_1.r_2_val_2.fq.gz
+bismark --multicore 2 /data/genomes/mm10/ -o DKO_data/mapped -1 DKO_data/fastq/trimmed/SLX-20416.SXTB01.HG7FNDRX2.s_1.r_1_val_1.fq.gz -2 DKO_data/fastq/trimmed/SLX-20416.SXTB01.HG7FNDRX2.s_1.r_2_val_2.fq.gz
+bismark --multicore 2 /data/genomes/mm10/ -o DKO_data/mapped -1 DKO_data/fastq/trimmed/SLX-20416.SXTC01.HG7FNDRX2.s_1.r_1_val_1.fq.gz -2 DKO_data/fastq/trimmed/SLX-20416.SXTC01.HG7FNDRX2.s_1.r_2_val_2.fq.gz
+bismark --multicore 2 /data/genomes/mm10/ -o DKO_data/mapped -1 DKO_data/fastq/trimmed/SLX-20416.SXTD01.HG7FNDRX2.s_1.r_1_val_1.fq.gz -2 DKO_data/fastq/trimmed/SLX-20416.SXTD01.HG7FNDRX2.s_1.r_2_val_2.fq.gz
+bismark --multicore 2 /data/genomes/mm10/ -o DKO_data/mapped -1 DKO_data/fastq/trimmed/SLX-20416.SXTE01.HG7FNDRX2.s_1.r_1_val_1.fq.gz -2 DKO_data/fastq/trimmed/SLX-20416.SXTE01.HG7FNDRX2.s_1.r_2_val_2.fq.gz
+bismark --multicore 2 /data/genomes/mm10/ -o DKO_data/mapped -1 DKO_data/fastq/trimmed/SLX-20416.SXTF01.HG7FNDRX2.s_1.r_1_val_1.fq.gz -2 DKO_data/fastq/trimmed/SLX-20416.SXTF01.HG7FNDRX2.s_1.r_2_val_2.fq.gz
+bismark --multicore 2 /data/genomes/mm10/ -o DKO_data/mapped -1 DKO_data/fastq/trimmed/SLX-20416.SXTG01.HG7FNDRX2.s_1.r_1_val_1.fq.gz -2 DKO_data/fastq/trimmed/SLX-20416.SXTG01.HG7FNDRX2.s_1.r_2_val_2.fq.gz
+bismark --multicore 2 /data/genomes/mm10/ -o DKO_data/mapped -1 DKO_data/fastq/trimmed/SLX-20416.SXTH01.HG7FNDRX2.s_1.r_1_val_1.fq.gz -2 DKO_data/fastq/trimmed/SLX-20416.SXTH01.HG7FNDRX2.s_1.r_2_val_2.fq.gz
