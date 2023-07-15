@@ -9,3 +9,4 @@ In each of the three directories is a set of "make" scripts called `make_....sh`
 The `scripts` directory contains some custom R, Python, and bash scripts used in the data processing steps.
 
 #### R session info
+The file "R_analysis.Rmd" contains the code used for data analysis.
