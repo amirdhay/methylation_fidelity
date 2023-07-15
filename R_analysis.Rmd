@@ -1,0 +1,3266 @@
+---
+title: "Epigenetic inheritance is unfaithful at intermediately methylated CpG sites"
+author: "Amir Hay"
+output:
+  html_document:
+    toc: true
+    toc_float: 
+      collapse: false
+    code_folding: "hide"
+---
+# Data prep
+## Load libraries
+``` {r setup, message=FALSE}
+library(svglite)
+library(rtracklayer)
+library(readr)
+library(GenomicFeatures)
+library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+library(tibble)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(reshape2)
+library(magrittr)
+library(tidyverse)
+library(ChIPpeakAnno)
+library(stringr)
+library(gridExtra)
+```
+
+
+## Functions
+``` {r functions,  message=FALSE}
+## Functions to read in methy files and convert to GRanges
+
+read_in_SureSelectMethyl <- function(SureSelectMethyl) {
+  SureSelectMethyl_tsv<-read_tsv(SureSelectMethyl, col_names=FALSE)
+  SureSelectMethyl_tsv=with(SureSelectMethyl_tsv, GRanges(X1, IRanges(start=X2, width=2), coverage=X3+X4, unmethy=X3, methy=X4))
+  SureSelectMethyl_tsv$methyPercent <- 100*(SureSelectMethyl_tsv$methy / SureSelectMethyl_tsv$coverage)
+  return(SureSelectMethyl_tsv)
+}
+
+read_in_bed_methy <- function(methy) {
+  methy <- read_tsv(methy, col_names = FALSE)
+  methy <- with(methy, GRanges(X1, IRanges(start=X2, end=X3), coverage=X10, methyPercent=X11))
+  #methy <- subsetByOverlaps(methy, agilent_cpg_expected)
+  return(methy)
+}
+
+read_in_3T3tsv_methy <- function(methy) {
+  methy <- read_tsv(methy, col_names = FALSE)
+  methy <- with(methy, GRanges(X1, IRanges(start=X2, width=2), coverage=X3+X4, methy=X3, unmethy=X4)) #methy and unmethy was flipped for some reason? (16/03/2021)
+  methy$methyPercent <- 100*(methy$methy / methy$coverage)
+  #methy <- subsetByOverlaps(methy, agilent_cpg_expected)
+  return(methy)
+}
+
+process_methy <- function(list_methy, methy_read_in_function) {
+  methy <- lapply(list_methy, methy_read_in_function)
+  namecol <- rep(names(methy), unlist(lapply(methy, length)))
+  methy <- unlist(GRangesList(methy))
+  methy$cellLine <- namecol
+  return(methy)
+}
+
+## Function for make.region.annotations
+list2GRanges <- function(list) {
+  all.regions <- GRanges()
+  for (type in names(list)) {
+    this.gr <- list[[type]]
+    mcols(this.gr) <- NULL
+    this.gr$type <- type
+    this.gr$index <- 1:length(this.gr)
+    all.regions <- c(all.regions, this.gr)
+  }
+  return(all.regions)
+}
+
+##Function to plot methylation distribution 
+
+plot_methy_dist <- function(methy_data, facet) {
+  methy_dist_plot <- methy_data %>%
+    ggplot(aes(x=methyPercent)) +
+    geom_histogram(binwidth=5, center=2.5) +
+    {if(missing(facet)) {
+    }
+    else if(facet=="cellType") {
+      facet_wrap(~cellType, scales = "free") 
+    } else if(facet=="cellLine") {
+      facet_wrap(~cellLine, scales = "free")
+    } 
+    }+
+    theme(text=element_text(size=20)) +
+    ylab("CpG count") +
+    xlab("Methylation (%)")
+  return(methy_dist_plot)
+}
+
+## Function for removing chr12, 18, 19, and X for df or gr
+remove_chr <- function(data, vector_chr_to_remove) {
+  chr_to_remove <- paste0("chr", vector_chr_to_remove)
+  chr <- paste0("chr",c(1:19, "X"))
+  chr_filtered <- setdiff(chr, chr_to_remove)
+  #chr_filtered <- paste0("chr",chr_to_keep)
+  if((class(data) %>% head(n=1)) == "GRanges") {
+    chrRemoved <- data %>% as.data.frame() %>% filter(seqnames %in% chr_filtered) %>% GRanges()
+  }
+  else if((class(data) %>% tail(n=1)) == "data.frame"){
+    chrRemoved <- data %>% filter(seqnames %in% chr_filtered)
+  }
+  else{
+    print("Invalid input class: GRanges or data frame required")
+  }
+  return(chrRemoved)
+}
+
+## Function to convert df to matrix
+cpg.df_to_cpg.matrixFormat <- function(cpg.df) {
+  cpg.df$cpg <- paste(cpg.df$seqnames, cpg.df$start, sep=":")
+  cpg.df$cpg <- paste(cpg.df$cpg, cpg.df$end, sep="-")
+  cpg.df <- select(cpg.df, cpg, cellLine, methyPercent)
+  cpg.df <- pivot_wider(cpg.df, names_from = cellLine, values_from = methyPercent) %>% as.data.frame() 
+  row.names(cpg.df) <- cpg.df$cpg
+  cpg.df$cpg <- NULL
+  return(cpg.df)
+}
+
+
+```
+
+## Load methylation data
+```{r get.methy.data,  message=FALSE}
+## Make a list of sample files names
+
+list_of_samples <- list(
+  MEF1p="/data/agilent/MEF_clones/methy/CpG_combine_SLX-19089.SXTA01.HTFMWDRXX.s_2.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  MEF1_1="/data/agilent/MEF_clones/methy/CpG_combine_SLX-19089.SXTB01.HTFMWDRXX.s_2.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  MEF1_2="/data/agilent/MEF_clones/methy/CpG_combine_SLX-19089.SXTC01.HTFMWDRXX.s_2.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  MEF1_3="/data/agilent/MEF_clones/methy/CpG_combine_SLX-19089.SXTD01.HTFMWDRXX.s_2.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  MEF1_4="/data/agilent/MEF_clones/methy/CpG_combine_SLX-19089.SXTE01.HTFMWDRXX.s_2.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  MEF1_5="/data/agilent/MEF_clones/methy/CpG_combine_SLX-19089.SXTF01.HTFMWDRXX.s_2.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  MEF1_6="/data/agilent/MEF_clones/methy/CpG_combine_SLX-19089.SXTG01.HTFMWDRXX.s_2.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  MEF1_7="/data/agilent/MEF_clones/methy/CpG_combine_SLX-19089.SXTH01.HTFMWDRXX.s_2.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  MEF2p="/data/agilent/MEF_clones/methy/CpG_combine_SLX-19089.SXTA02.HTFMWDRXX.s_2.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  MEF2_1="/data/agilent/MEF_clones/methy/CpG_combine_SLX-19089.SXTB02.HTFMWDRXX.s_2.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  MEF2_2="/data/agilent/MEF_clones/methy/CpG_combine_SLX-19089.SXTC02.HTFMWDRXX.s_2.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  MEF2_3="/data/agilent/MEF_clones/methy/CpG_combine_SLX-19089.SXTD02.HTFMWDRXX.s_2.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  MEF2_4="/data/agilent/MEF_clones/methy/CpG_combine_SLX-19089.SXTE02.HTFMWDRXX.s_2.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  MEF2_5="/data/agilent/MEF_clones/methy/CpG_combine_SLX-19089.SXTF02.HTFMWDRXX.s_2.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  MEF2_6="/data/agilent/MEF_clones/methy/CpG_combine_SLX-19089.SXTG02.HTFMWDRXX.s_2.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  MEF2_7="/data/agilent/MEF_clones/methy/CpG_combine_SLX-19089.SXTH02.HTFMWDRXX.s_2.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt"
+)
+
+## Read in files using function and list above
+
+all_methy_data <- lapply(list_of_samples,read_in_SureSelectMethyl)
+
+## Make long data frame of the GRanges
+
+namecol <- rep(names(all_methy_data), unlist(lapply(all_methy_data, length)))
+all_methy_data <- unlist(GRangesList(all_methy_data))
+all_methy_data$cellLine <- namecol
+all_methy_data$cellType <- substr(all_methy_data$cellLine, 1,4)
+names(all_methy_data) <- NULL
+all_methy_data.df <- as.data.frame(all_methy_data)
+rm(all_methy_data)
+rm(namecol)
+gc()
+```
+
+
+## Load publicly avaiable methylation data
+``` {r get.published.methy.data, message=FALSE}
+
+#Load mm10 CpGs
+mm10CpG = readRDS("/data/genomes/mm10/annotation/mm10.CpG.gr.RDS")
+#Load target capture probe design
+agilent_probe_design <- import.bed("/home/adh54/Target_Capture/new_agilentSureSelect_DNAmeTargets.mm10.bed")
+#Get mm10 CpGs within the target capture probe design
+agilent_cpg_expected <- subsetByOverlaps(mm10CpG, agilent_probe_design)
+
+#Load methylation data from immortalised MEF lines (3T3) / filter by target capture CpGs
+list_of_3T3 <- list(rep1_3T3 = "/data/MEF_WGBS_public_data/3T3_rep1.tsv",
+                    rep2_3T3 = "/data/MEF_WGBS_public_data/3T3_rep2.tsv",
+                    rep3_3T3 = "/data/MEF_WGBS_public_data/3T3_rep3.tsv"
+)
+
+methy_3T3 <- process_methy(list_of_3T3, read_in_3T3tsv_methy)
+methy_3T3$cellType <- "3T3"
+methy_3T3$dataSet <- "Szyf2020"
+names(methy_3T3) <- NULL
+methy_3T3.df <- as.data.frame(methy_3T3) %>% filter(coverage >= 10)
+rm(methy_3T3)
+gc()
+
+#Load methylation data from primary MEF line / liftOver from mm9 to mm10 / filter by target capture CpGs
+mm9_to_mm10_chain <- import.chain("/data/genomes/liftOver/mm9ToMm10.over.chain")
+MEF_karaulanov <- read_tsv("/data/MEF_WGBS_public_data/GSM2648457_MEF_WGBS_WT_CpG_methylcount.tsv", col_names=FALSE) 
+MEF_karaulanov <- MEF_karaulanov %>% 
+  filter(X6=="CG",!(X4==0 & X5==0), !(X4+X5<10))
+MEF_karaulanov.gr <- with(MEF_karaulanov, GRanges(X1, IRanges(start=X2, width=2), strand=X3, methy=X4, unmethy=X5, coverage=X4+X5, methyPercent=100*(X4/(X4+X5)))) 
+MEF_karaulanov.gr <- liftOver(MEF_karaulanov.gr, mm9_to_mm10_chain) %>% unlist()
+#MEF_karaulanov.gr <- subsetByOverlaps(MEF_karaulanov.gr, agilent_cpg_expected)
+MEF_karaulanov.gr$cellType <- "MEF_karaulanov"
+MEF_karaulanov.gr$cellLine <- "MEF_karaulanov"
+MEF_karaulanov.gr$dataSet <- "MEF_karaulanov"
+MEF_karaulanov.df <- as.data.frame(MEF_karaulanov.gr)
+rm(MEF_karaulanov.gr)
+rm(MEF_karaulanov)
+gc()
+
+#Load methylation data from ENCODE limb e13.5 and e14.5 published data upload / filter by target capture CpGs
+list_of_samples_encode <- list(limb_e14_rep1 = "/data/encode_WGBS/ENCFF176VLZ.bed",
+                                 limb_e14_rep2 = "/data/encode_WGBS/ENCFF038IVS.bed",
+                                 limb_e13_rep1 = "/data/encode_WGBS/ENCFF556ENA.bed",
+                                 limb_e13_rep2 = "/data/encode_WGBS/ENCFF834PXN.bed"
+                                 )
+
+
+methy_encode <- process_methy(list_of_samples_encode, read_in_bed_methy) 
+methy_encode$cellType <- substr(methy_encode$cellLine, 1,8)
+methy_encode$dataSet <- "Encode"
+names(methy_encode) <- NULL
+methy_encode.df <- as.data.frame(methy_encode) %>% filter(coverage >= 10)
+rm(methy_encode)
+gc()
+
+```
+
+
+## Loading publically available ENCODE ChIP-seq peak data of various histone tail mods
+``` {r load.peaks}
+#The following datasets are from E13.5 embryos
+h3k27me3.ChIP_seq.e13.5limb.gr <- read_tsv("/data/public_chip/ENCFF223KSJ.bed", col_names=FALSE) %>% with(., GRanges(X1, IRanges(X2, X3)))
+h3k9me3.ChIP_seq.e13.5limb.gr <- read_tsv("/data/public_chip/ENCFF293BQI.bed", col_names=FALSE) %>% with(., GRanges(X1, IRanges(X2, X3)))
+h3k4me3.ChIP_seq.e13.5limb.gr <- read_tsv("/data/public_chip/ENCFF829LEB.bed", col_names=FALSE) %>% with(., GRanges(X1, IRanges(X2, X3)))
+h3k36me3.ChIP_seq.e13.5limb.gr <- read_tsv("/data/public_chip/ENCFF404DJU.bed", col_names=FALSE) %>% with(., GRanges(X1, IRanges(X2, X3)))
+h3k27ac.ChIP_seq.e13.5limb.gr <- read_tsv("/data/public_chip/ENCFF283BKX.bed", col_names=FALSE) %>% with(., GRanges(X1, IRanges(X2, X3)))
+h3k9ac.ChIP_seq.e13.5limb.gr <- read_tsv("/data/public_chip/ENCFF733UCO.bed", col_names=FALSE) %>% with(., GRanges(X1, IRanges(X2, X3)))
+
+```
+
+## Make region annotations
+``` {r make.region.annotations,  message=FALSE}
+##Upload repetitive sequence annotations via Dfam
+dfam_annotations <- read_tsv("/data/genomes/mm10/annotation/rmskOutCurrent.Dfam_2_0.v4_0_7.txt", col_names=FALSE)
+dfam_annotations_withStrand =  with(dfam_annotations, GRanges(X6, IRanges(start=X7, end=X8), strand=X10, specific_type=X11, type=X12, alt_type_name=X13))
+dfam_annotations = with(dfam_annotations, GRanges(X6, IRanges(start=X7, end=X8),type=X12))
+
+
+repetitive.list <- list(
+  simple_repeat = dfam_annotations[dfam_annotations$type=="Simple_repeat"],
+  satellite =  dfam_annotations[dfam_annotations$type=="Satellite"],
+  low_complexity = dfam_annotations[dfam_annotations$type=="Low_complexity"]
+)
+repetitive.list <- lapply(repetitive.list, GenomicRanges::reduce, ignore.strand=TRUE)
+
+repetitive.list.named <- list()
+for(region.name in names(repetitive.list)) {
+  region.df <- as.data.frame(repetitive.list[[region.name]]) 
+  region.df$type <- region.name
+  repetitive.list.named[[region.name]] <- region.df
+  
+}
+repetitive.named.gr <- repetitive.list.named %>% bind_rows() %>% GRanges()
+
+
+TE.withStrand <- list( 
+  LTRs = dfam_annotations_withStrand[dfam_annotations_withStrand$type=="LTR"],
+  LINEs = dfam_annotations_withStrand[dfam_annotations_withStrand$type=="LINE"],
+  SINEs = dfam_annotations_withStrand[dfam_annotations_withStrand$type=="SINE"],
+  DNA = dfam_annotations_withStrand[dfam_annotations_withStrand$type=="DNA"] 
+  )
+
+TE.list <- list(
+  LTRs = dfam_annotations[dfam_annotations$type=="LTR"],
+  LINEs = dfam_annotations[dfam_annotations$type=="LINE"],
+  SINEs = dfam_annotations[dfam_annotations$type=="SINE"],
+  DNA = dfam_annotations[dfam_annotations$type=="DNA"]
+)
+TE.list <- lapply(TE.list, GenomicRanges::reduce, ignore.strand=TRUE)
+
+
+##Upload gene annotations via Gencode
+######Not sure where Noah got this gencode file... Need to figure that out
+gencode <- read_tsv(
+  "/data/genomes/mm10/annotation/mm10.GENCODE_VM20.gp", 
+  col_names=c("name","chrom","strand","txStart", "txEnd", "cdsStart", "cdsEnd", "exonCount", "exonStarts","exonEnds"),
+  col_types=cols(exonStarts="c",exonEnds="c")
+)
+
+gencode_geneBody.gr <-  gencode %>%
+  select(chrom, strand, txStart, txEnd) %>%
+  GRanges()
+  
+
+gencode_UTRs <- gencode %>% 
+  #######filter out non-coding sequences
+  filter(!(cdsStart==cdsEnd)) %>% 
+  mutate(UTRp5_start = ifelse(strand=="+", txStart, cdsEnd),
+         UTRp5_end = ifelse(strand=="+", cdsStart, txEnd),
+         UTRp3_start = ifelse(strand=="+", cdsEnd, txStart),
+         UTRp3_end = ifelse(strand=="+", txEnd, cdsStart), 
+         length_UTRp5=UTRp5_end-UTRp5_start,
+         length_UTRp3=UTRp3_end-UTRp3_start) %>% 
+  filter(!(length_UTRp5==0 & length_UTRp3==0) & !(length_UTRp5>1000) & !(length_UTRp3>1000))
+  
+
+gencode_5pUTR.gr <- gencode_UTRs %>% 
+  filter(length_UTRp5 > 0) %>%
+  select(chrom, strand, UTRp5_start, UTRp5_end) %>%
+  GRanges()
+
+gencode_3pUTR.gr <- gencode_UTRs %>% 
+  filter(length_UTRp3 > 0) %>%
+  select(chrom, strand, UTRp3_start, UTRp3_end) %>%
+  GRanges()
+
+#"Promoters are arbitrarily defined as regions 2Kb upstream the TSS for each RefSeq transcript." Lister...Ecker 2009 Nature
+# quote from https://static-content.springer.com/esm/art%3A10.1038%2Fnature08514/MediaObjects/41586_2009_BFnature08514_MOESM10_ESM.pdf
+# I made mine -1kb from the TSS
+gencode_promoter.gr <- gencode %>% 
+  mutate(txStart = ifelse(strand=="-", txEnd, txStart),
+         promoterStart = ifelse(strand=="+", txStart-1000, txStart+1000),
+         start = ifelse(strand=="+", promoterStart, txStart),
+         end = ifelse(strand=="+", txStart, promoterStart)) %>%
+  select(chrom, strand, start, end) %>%
+  GRanges()
+
+gencode_tts.gr <- gencode %>% 
+  mutate(txEnd = ifelse(strand=="-", txStart, txEnd),
+         tts2000 = ifelse(strand=="+", txEnd+2000, txEnd-2000),
+         start = ifelse(strand=="+", txEnd,  tts2000),
+         end = ifelse(strand=="+", tts2000, txEnd)) %>%
+  select(chrom, strand, start, end) %>%
+  GRanges()
+        
+
+exonStarts.list <- gencode %>% 
+  pull(exonStarts) %>% 
+  gsub(",$","",.) %>% 
+  str_split(",") 
+  
+names(exonStarts.list) = gencode$name
+exonStarts.df <- stack(exonStarts.list) %>%
+  rename(c("name"="ind","exonStart"="values"))
+
+exonEnds.list <- gencode %>% 
+  pull(exonEnds) %>% 
+  gsub(",$","",.) %>% 
+  str_split(",") 
+
+names(exonEnds.list) = gencode$name
+exonEnds.df <- stack(exonEnds.list) %>%
+rename(c("name"="ind","exonEnd"="values"))
+
+gencode_1st_exon.gr <- left_join(gencode, exonStarts.df) %>%
+  left_join(exonEnds.df) %>% 
+  group_by(name) %>%
+  mutate(n=1:n(), len=n()) %>% 
+  filter(
+    n == ifelse(strand=="+",1,len)
+  ) %>%
+  ungroup() %>%
+  select(chrom, strand, exonStart, exonEnd) %>%
+  GRanges()
+    
+gencode_exons.gr <- left_join(gencode, exonStarts.df) %>%
+  mutate(exonEnd=exonEnds.df$exonEnd) %>%
+  select(chrom, strand, exonStart, exonEnd) %>%
+  GRanges()
+
+intronEnds.df <- exonStarts.df %>%
+  mutate(intronEnd=exonStart) %>%
+  group_by(name) %>%
+  mutate(count=row_number()) %>%
+  filter(!count==1)
+
+intronStarts.df <- exonEnds.df %>%
+  mutate(intronStart=exonEnd) %>%
+  group_by(name) %>%
+  mutate(count=row_number(), n=n()) %>% 
+  filter(!count==n)
+  
+
+gencode_introns.gr <- left_join(gencode, intronStarts.df) %>% 
+  filter(!exonCount==1) %>% 
+  mutate(intronStart=as.double(intronStarts.df$intronStart), intronEnd = as.double(intronEnds.df$intronEnd)) %>%
+  select(chrom, strand, intronStart, intronEnd) %>%
+  GRanges()
+
+
+genic.list <- list(
+  tss_1kb=gencode_promoter.gr,
+  introns=gencode_introns.gr,
+  exons=gencode_exons.gr,
+  tts_2kb=gencode_tts.gr,
+  encode_1st_exon=gencode_1st_exon.gr
+)
+ 
+#Fixed 
+analysis.genic.list <- list(
+  Promoters=ensembl_promoter.protein_coding.gr,
+  Introns=ensembl_introns.gr,
+  Exons=ensembl_exon.protein_coding.gr
+)
+
+
+genic.list <- lapply(genic.list, GenomicRanges::reduce, ignore.strand=TRUE)
+
+##Upload CpG Island annotations
+cpgIslands <- read_tsv("/data/reference/cpgIslands/cpgIslandExt.txt", 
+                       col_names=c("bin","chrom","start","end","name","length","cpgNum","gcNum","perCpg","perGc","obsExp")) 
+
+cpgIslands.unmasked <- read_tsv("/data/reference/cpgIslands/cpgIslandExtUnmasked.txt", col_names=c("bin","chrom","start","end","name","length","cpgNum","gcNum","perCpg","perGc","obsExp")) 
+
+cpgIslands.gr <- cpgIslands %>% select("chrom", "start", "end") %>% GRanges()
+
+cpgIslands.unmasked.gr <- cpgIslands.unmasked %>% select("chrom", "start", "end") %>% GRanges()
+
+cpgShores.gr <- cpgIslands.gr %>%
+  flank(width=2000) 
+cpgIslands.list <- list(
+  cpgIslands=cpgIslands.gr,
+  cpgShores=cpgShores.gr
+)
+cpgIslands.list <- lapply(cpgIslands.list, GenomicRanges::reduce, ignore.strand=TRUE)
+
+##Upload genomic imprint annotations
+imprints <-  import.bed("/home/adh54/Target_Capture/mouse_DMRs.mm10.noNames.bed")
+
+##Combine annotations
+all.regions.list <- list(
+  repetitive.list,
+  TE.list,
+  cCREs.list,
+  genic.list,
+  cpgIslands.list
+)
+
+names(all.regions.list) <- c("Repetitive", "TEs","cCREs","Genic","CpG islands/shores")
+
+all.region.gr <- lapply(all.regions.list, list2GRanges) %>% GRangesList() %>% unlist()
+all.region.gr$regionType <- names(all.region.gr)
+names(all.region.gr) <- NULL
+  
+##Make a combined annotation that is reduced at the region type level (for when comparing between region types)
+all.regionType.gr  <- all.region.gr %>% 
+  split(., all.region.gr$regionType) %>% 
+  lapply(GenomicRanges::reduce, ignore.strand=TRUE) %>%
+  GRangesList() %>% 
+  unlist()
+all.regionType.gr$regionType <- names(all.regionType.gr)
+names(all.regionType.gr) <- NULL
+
+
+##Combine annotations for analysis (28/10/21)
+analysis.regions.list <- list(
+  analysis.genic.list,
+  TE.list
+)
+
+names(analysis.regions.list) <- c("Genic","TEs")
+analysis.regions.gr <- lapply(analysis.regions.list, list2GRanges) %>% GRangesList() %>% unlist()
+analysis.regions.gr$regionType <- names(analysis.regions.gr)
+names(analysis.regions.gr) <- NULL
+
+analysis.regionType.gr <- analysis.regions.gr %>%
+  split(., analysis.regions.gr$regionType) %>%
+  lapply(GenomicRanges::reduce, ignore.strand=TRUE) %>% 
+  GRangesList() %>%
+  unlist()
+analysis.regionType.gr$regionType <- names(analysis.regionType.gr)
+names(analysis.regionType.gr) <- NULL
+  
+
+```
+
+# Thresholding and filtering data
+## Thresholding data by coverage ≥ 10x
+``` {r coverage.thresholding,  message=FALSE}
+
+## Function to threshold by 10x coverage 
+threshold_10x_cov <- function(methy_data, cell_type_vector) {
+  if(missing(cell_type_vector)) {
+    all.n.datasets <-  methy_data %>% pull(cellLine) %>% unique() %>% length()
+    thresholded_data <- methy_data %>% 
+      filter(coverage >= 10) %>%
+      group_by(seqnames, start, end) %>%
+      dplyr::count(name="n.datasets") %>%
+      filter(n.datasets==all.n.datasets) %>% 
+      ungroup()
+  }
+  else {
+    thresholded_data <- methy_data %>%filter(coverage >= 10, cellType %in% cell_type_vector) 
+    all.n.datasets <-  thresholded_data %>% pull(cellLine) %>% unique() %>% length()  
+    thresholded_data <- thresholded_data %>% 
+      group_by(seqnames, start, end) %>%
+      count(name="n.datasets") %>%
+      filter(n.datasets==all.n.datasets) %>% 
+      ungroup()
+  }
+  return(thresholded_data)
+}
+
+#Threshold methy data by ≥10x coverage for MEFs 
+cpg_tenx_all_datasets <- threshold_10x_cov(all_methy_data.df)
+all_methy_cpg_tenx.df <- inner_join(all_methy_data.df,cpg_tenx_all_datasets)
+
+cpg_tenx_MEF_datasets <- threshold_10x_cov(all_methy_data.df, c("MEF1", "MEF2"))
+MEF_methy_cpg_tenx.df <- inner_join((all_methy_data.df %>% filter(cellType %in% c("MEF1","MEF2"))), cpg_tenx_MEF_datasets)
+MEF_methy_cpg_tenx.gr <- inner_join((all_methy_data.df %>% filter(cellType %in% c("MEF1","MEF2"))), cpg_tenx_MEF_datasets) %>% GRanges()
+
+
+```
+
+
+## Determining the coverage distribution of cell lineages to make "karyotypes"
+``` {r coverage.distribution,  message=FALSE}
+
+library(patchwork)
+
+#Make normalised mean coverage across cellType df for MEFs
+normalised_mean_cov_cellType.MEFs <- MEF_methy_cpg_tenx.df %>%
+  group_by(cellType) %>%
+  mutate(cellType_cov=sum(coverage)) %>% 
+  group_by(seqnames, start, end, cellType) %>% 
+  summarise(mean_cov=mean(coverage), normalised_mean_cov=mean_cov/unique(cellType_cov)) %>%
+  ungroup()
+
+#Plot normalised mean coverage across cell lineage for MEFs
+seqs_to_keep <- paste0("chr",c(1:19, "X"))
+
+normalised_mean_cov_cellType.MEFs$cellType <- factor(normalised_mean_cov_cellType.MEFs$cellType, levels=c("MEF1", "MEF2"), labels=c("MEF line 1 \n (n=8, parent + 7 clones)","MEF line 2 \n (n=8, parent + 7 clones)"))
+
+normalised_mean_cov_cellType.MEFs.plot <- normalised_mean_cov_cellType.MEFs %>% 
+  filter(seqnames %in% seqs_to_keep) %>% 
+  mutate(cellTypeReal=substr(cellType, 1, 3)) %>% 
+  ggplot() +
+  geom_line(aes(x=start, y=-log2(normalised_mean_cov),group=cellType,color=cellType, alpha=cellType), show.legend = FALSE) +
+  facet_grid(rows = vars(seqnames), cols=vars(cellTypeReal)) +
+  theme_bw() +
+  theme(text=element_text(size=25), strip.background.x = element_blank(), strip.text.x = element_blank(), axis.text.x = element_text(angle=45, vjust=1, hjust=1), axis.text.y = element_text(size=15)) +
+  scale_color_manual(values=c("MEF line 1 \n (n=8, parent + 7 clones)"="red", "MEF line 2 \n (n=8, parent + 7 clones)" = "blue")) +
+  scale_alpha_manual(values=c("MEF line 1 \n (n=8, parent + 7 clones)"= 0.4, "MEF line 2 \n (n=8, parent + 7 clones)"= 0.4)) +
+  coord_cartesian(ylim=c(20,25)) +
+  xlab("Base pairs") +
+  ylab("-log2(Normalised mean coverage)") + 
+  labs(color="Cell Line") +
+  guides(alpha=FALSE) +
+  scale_y_continuous(breaks=c(21,23,25))
+
+#Extended Data Figure 1A
+#Make normalised median coverage across a MEF cell line
+normalised_cov_cellLine_medians.MEFs <- MEF_methy_cpg_tenx.df %>%
+  filter(seqnames %in% seqs_to_keep) %>% 
+  group_by(cellLine) %>%
+  mutate(cellLine_cov=sum(coverage)) %>% 
+  ungroup() %>% 
+  mutate(normalised_cov = coverage/cellLine_cov) %>% 
+  group_by(seqnames, cellLine) %>%
+  summarise(median_normalised_cov=median(normalised_cov))
+
+median_of_normalised_median_cov_chr.MEFs <- normalised_cov_cellLine_medians.MEFs %>%
+  group_by(seqnames) %>%
+  mutate(median_of_medians = median(median_normalised_cov), line_index = str_sub(cellLine, start=-1), cellType=substr(cellLine, 1, 4))
+
+#Plot normalised median coverages by individual MEF cell lines 
+median_of_normalised_median_cov_chr.MEFs$cellType <- factor(median_of_normalised_median_cov_chr.MEFs$cellType, levels=c("MEF1", "MEF2"), labels=c("MEF line 1 \n (n=8, parent + 7 clones)","MEF line 2 \n (n=8, parent + 7 clones)"))
+normalised_cov_cellLine_medians.MEFs.plot <- median_of_normalised_median_cov_chr.MEFs %>% 
+  ggplot() + 
+  geom_point(aes(x=line_index, y=-log2(median_normalised_cov), color=cellType), size=3) +
+  scale_color_manual(values=c("MEF line 1 \n (n=8, parent + 7 clones)"="red", "MEF line 2 \n (n=8, parent + 7 clones)" = "blue")) +
+  facet_grid(rows=vars(seqnames), scales="free_x") +
+  theme_bw() + 
+  theme(text=element_text(size=25)) +
+  theme(axis.text.x = element_text(angle=45, vjust=1, hjust=1), axis.text.y = element_text(size=15)) +
+  scale_y_continuous(breaks=c(19.5, 20.5, 21.5), limits = c(18.9, 22.1)) +
+  ylab("-log2(Normalised median coverage)") +
+  xlab("Clonal (1-7) and parental (p) cell lines ") +
+  labs(color="") 
+
+#Extended Data Figure 1B
+#Fixed plots for MEF karyotypes below (9/5/23 - for paper revisions)
+normalised_mean_cov_cellType.MEFs$normalised_mean_cov_fixed <- normalised_mean_cov_cellType.MEFs$normalised_mean_cov * 8
+
+normalised_mean_cov_cellType.MEFs.plot_fixed <- normalised_mean_cov_cellType.MEFs %>% 
+  filter(seqnames %in% seqs_to_keep) %>% 
+  mutate(cellTypeReal=substr(cellType, 1, 3)) %>% 
+  ggplot() +
+  geom_line(aes(x=start, y=-log2(normalised_mean_cov_fixed),group=cellType,color=cellType, alpha=cellType), show.legend = FALSE) +
+  facet_grid(rows = vars(seqnames), cols=vars(cellTypeReal)) +
+  theme_bw() +
+  theme(text=element_text(size=25), strip.background.x = element_blank(), strip.text.x = element_blank(), axis.text.x = element_text(angle=45, vjust=1, hjust=1), axis.text.y = element_text(size=15)) +
+  scale_color_manual(values=c("MEF line 1 \n (n=8, parent + 7 clones)"="red", "MEF line 2 \n (n=8, parent + 7 clones)" = "blue")) +
+  scale_alpha_manual(values=c("MEF line 1 \n (n=8, parent + 7 clones)"= 0.4, "MEF line 2 \n (n=8, parent + 7 clones)"= 0.4)) +
+  coord_cartesian(ylim=c(18,22)) +
+  xlab("Base pairs") +
+  ylab("-log2(Normalised mean coverage)") + 
+  labs(color="Cell Line") +
+  guides(alpha=FALSE) +
+  scale_y_continuous(breaks=c(18,20,22))
+
+
+# Combine filtering plots
+
+filtering.MEF.methy.plot <- normalised_mean_cov_cellType.MEFs.plot + normalised_cov_cellLine_medians.MEFs.plot
+ggsave("filtering.MEF.methy.plot.png", filtering.MEF.methy.plot, width=18, height=18)
+
+
+```
+
+
+## Filter data by chromosomes
+``` {r make.filtered.data,  message=FALSE}
+##Removing cpgs from chr12, 18, 19, X on MEF datasets
+MEF_methy_cpg_tenx.gr_chrRemoved <- remove_chr(MEF_methy_cpg_tenx.gr, c(12,18,19,"X"))
+
+#CpGs that will be used for further analysis 
+MEF_cpgs.gr <- MEF_methy_cpg_tenx.gr_chrRemoved %>% as.data.frame() %>% group_by(seqnames, start, end) %>% summarise(methyPercent.mean = mean(methyPercent)) %>% GRanges()
+
+#Removing cpgs from chr12, 18, 19, X on public datasets
+#and getting only the CpGs from the target capture
+MEF_karaulanov.df_chrRemoved <- remove_chr(GRanges(MEF_karaulanov.df), c(12,18,19,"X")) %>% as.data.frame() %>% inner_join(.,  as.data.frame(MEF_cpgs.gr) %>% select(seqnames, start, end))
+methy_encode.df_chrRemoved <- remove_chr(GRanges(methy_encode.df), c(12,18,19,"X")) %>% as.data.frame() %>% inner_join(., as.data.frame(MEF_cpgs.gr))
+methy_3T3.df_chrRemoved <- remove_chr(GRanges(methy_3T3.df), c(12,18,19,"X")) %>% as.data.frame() %>% inner_join(., as.data.frame(MEF_cpgs.gr))
+
+#for whole genome (wg) + avg methy across datasets within dfs to save space 
+seqs_to_keep.wg <- paste0("chr",c(1:19, "X"))
+MEF_karaulanov.df <- MEF_karaulanov.df %>% filter(seqnames %in% seqs_to_keep.wg)
+methy_encode.df <- methy_encode.df %>% filter(seqnames %in% seqs_to_keep.wg) %>% group_by(seqnames, start, end, cellType, dataSet) %>% summarise(methyPercent = mean(methyPercent)) %>% ungroup()
+methy_3T3.df <- methy_3T3.df %>% filter(seqnames %in% seqs_to_keep.wg) %>% group_by(seqnames, start, end, cellType, dataSet) %>% summarise(methyPercent = mean(methyPercent)) %>% ungroup()
+ 
+
+
+```
+
+## Plots for filtered and thresholded data
+``` {r threshold_filter.plot}
+# Plot to show 10x 
+
+#Extended Data Figure 1D
+coverage_MEFs.thresholded.plot <- as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>% 
+  select(seqnames, start, end, coverage) %>% 
+  ggplot() + 
+  geom_bar(aes(x=coverage)) + 
+  coord_cartesian(xlim=c(0, 100)) +
+  theme_minimal() + 
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+        axis.ticks.x = element_line(colour="black", size=0.5),
+        text=element_text(colour="black", size=9),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5)) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_x_continuous(expand = c(0,0)) +
+  xlab("Read coverage") +
+  ylab("CpG counts") 
+
+ggsave("coverage_MEFs.thresholded.plot.pdf", coverage_MEFs.thresholded.plot, width=2, height=1.5)
+
+
+```
+
+# Method and data validation 
+## Comparing methylation of MEFs to published datasets
+``` {r compare.to.published.data,  message=FALSE}
+
+
+# Prepare data for plotting
+## Target capture mean methy calculation (tc = target capture)
+MEF_datasets.list <- list(as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>% mutate(dataSet="amir"), methy_encode.df_chrRemoved, MEF_karaulanov.df_chrRemoved, methy_3T3.df_chrRemoved)
+MEF_datasets.df_tc <- MEF_datasets.list %>% bind_rows()
+MEF_datasets.df_tc$dataSet_type <- "Target capture"
+MEF_datasets.df_tc$cellType <- factor(MEF_datasets.df_tc$cellType, levels=c("MEF1", "MEF2", "MEF_karaulanov", "3T3", "limb_e13", "limb_e14"), labels=c("MEF line 1 \n (n=8, parent + 7 clones)","MEF line 2 \n (n=8, parent + 7 clones)", "Primary MEFs", "3T3 immortalised MEFs", "E13.5 mouse limb", "E14.5 mouse limb"))
+
+# Extended Data Figure 1B
+MEF_datasets.methy_boxplot <- MEF_datasets.df_tc %>% 
+  ggplot() + 
+  geom_boxplot(aes(y=methyPercent, x=cellType, color=cellType)) +
+  theme_minimal() + 
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+          text=element_text(colour="black", size=9),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line = element_line(color="black", size=0.5),
+        axis.text.x = element_text(angle=45, hjust=1, vjust=1),
+        legend.position = "none") +
+  xlab("") +
+  ylab("Methylation (%)") 
+ggsave("MEF_datasets.methy_boxplot.pdf", MEF_datasets.methy_boxplot, width=2, height=2.5)
+
+
+## Genome-wide mean methy calculation
+public_methy_data.list <- list(methy_encode.df, MEF_karaulanov.df, methy_3T3.df)
+public_methy_data.df <- public_methy_data.list %>% bind_rows()
+public_methy_data.df$dataSet_type <- "Genome-wide"
+means.genomeWide.public <- lapply(public_methy_data.list, calculate_mean_methy_cov) %>% bind_rows()
+means.genomeWide.public$cellType <- factor(means.genomeWide.public$cellType, levels=c("MEF1", "MEF2", "MEF_karaulanov", "3T3", "limb_e13", "limb_e14"), labels=c("MEF-1","MEF-2", "Primary MEFs", "3T3 immortalised MEFs", "E13.5 mouse limb", "E14.5 mouse limb"))
+means.genomeWide.public$cpgType <- "Genome-wide"
+
+MEF_datasets.methy_boxplot.wg <- bind_rows(methy_encode.df, MEF_karaulanov.df, methy_3T3.df) %>%
+    ggplot() + 
+  geom_boxplot(aes(y=methyPercent, x=cellType, color=cellType)) +
+  theme_minimal() + 
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+          text=element_text(colour="black", size=9),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line = element_line(color="black", size=0.5),
+        axis.text.x = element_text(angle=45, hjust=1, vjust=1),
+        legend.position = "none") +
+  xlab("") +
+  ylab("Methylation (%)") 
+ggsave("MEF_datasets.methy_boxplot.wg.png", MEF_datasets.methy_boxplot.wg, width=2, height=2.5)
+
+
+```
+
+## Methylation distribution across cell type with thresholded and filtered data
+``` {r methy.distribution.filtered, message=FALSE}
+
+#Extended Data Figure 1A
+#Plot methylation distribution density plot for MEF methylation data (ours and public)
+methylation_distribution.MEFs.plot <- MEF_datasets.df_tc %>% 
+  ggplot(aes(x=methyPercent, y=..scaled.., color=cellType)) + 
+  geom_density(show.legend = FALSE) + 
+  stat_density(geom="line", position="identity") +
+  theme_minimal() +
+  theme( panel.grid.major = element_blank(), 
+        text = element_text(size=9, colour="black"),
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.ticks = element_line(size=0.5, colour = "black"),
+        axis.line = element_line(color="black", size=0.5)
+        ) + 
+  guides(color = guide_legend(override.aes = list(size=3))) +
+  ylab("Scaled distribution") +
+  xlab("Methylation (%)") + 
+  scale_y_continuous(expand=c(0,0)) +
+  scale_x_continuous(expand=c(0,0))
+
+ggsave("methylation_distribution.MEFs.plot.pdf", methylation_distribution.MEFs.plot, width=2, height=1.5)
+
+#Extended Data Figure 1C
+#Plot methylation distribution density plot for MEF methylation data (ours and public) at Imprints
+methylation_distribution.imprints.MEFs.plot <- as.data.frame(subsetByOverlaps(MEF_datasets.df_tc %>% GRanges(), imprints))  %>% 
+  ggplot(aes(x=methyPercent, y=..scaled.., color=cellType)) + 
+  geom_density(show.legend = FALSE) + 
+  stat_density(geom="line", position="identity") +
+  theme_minimal() +
+  theme( panel.grid.major = element_blank(), 
+        text = element_text(size=9, colour="black"),
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.ticks = element_line(size=0.5, colour = "black"),
+        axis.line = element_line(color="black", size=0.5)
+        ) +
+  ylab("Scaled distribution") +
+  xlab("Methylation (%)") + 
+  scale_y_continuous(expand=c(0,0)) +
+  scale_x_continuous(expand=c(0,0))
+
+ggsave("methylation_distribution.imprints.MEFs.plot.pdf", methylation_distribution.imprints.MEFs.plot, width=2, height=1.5)
+
+```
+
+
+# CpG methylation and expression analysis
+
+## K-means clustering of CpGs
+``` {r make.clusters,  message=FALSE}
+
+library(cluster)
+library(factoextra)
+library(NbClust)
+set.seed(210218)
+# K means clustering the data
+MEF_methy_cpg_tenx.gr_chrRemoved.matrix <- cpg.df_to_cpg.matrixFormat(as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved)) %>% as.matrix()
+MEF_methy_cpg_tenx.gr_chrRemoved.matrix.Ks <-  sapply(2:20, function(i) summary(silhouette(clara(MEF_methy_cpg_tenx.gr_chrRemoved.matrix,k=i)))$avg.width)
+avg_silhouette_plot <- plot(2:20, MEF_methy_cpg_tenx.gr_chrRemoved.matrix.Ks, xlab="k", ylab="Average silhouette values", type="b", pch=19)
+MEF_methy_cpg_tenx.gr_chrRemoved.matrix.clara <- cluster::clara(MEF_methy_cpg_tenx.gr_chrRemoved.matrix, k=7)
+
+
+```
+
+## Prepping CpG GRanges object for plotting heatmaps
+``` {r cpg.dataframe}
+
+## Function to add cluster information to data
+add_clusters_to_cpgs <- function(methy_data, cluster_matrix) {
+  # Get cluster per CpG
+  cluster_info <- GRanges(names(cluster_matrix$clustering), cluster=unname(cluster_matrix$clustering))
+  # Put cluster info into all methy data object
+  methy_cluster.overlap <- findOverlaps(methy_data, cluster_info)
+  methy_data$cluster <- NA
+  methy_data[queryHits(methy_cluster.overlap)]$cluster <- cluster_info[subjectHits(methy_cluster.overlap)]$cluster
+  return(methy_data)
+}
+
+## Function to add "heatmap friendly"" cell type and cell line information 
+add_cellsample_info_for_plotting <- function(methy_data) {
+  # "methy_data" must be a GRanges object
+    # Adding cellType plot info
+    methy_data$cellTypePlot <- methy_data$cellType
+    methy_data[methy_data$cellLine=="MEF1p"]$cellTypePlot <- "MEF1p"
+    methy_data[methy_data$cellLine=="MEF2p"]$cellTypePlot <- "MEF2p"
+    methy_data$cellTypePlot <- factor(methy_data$cellTypePlot, levels=c("MEF1p","MEF1","MEF2p","MEF2"))
+    # Adding cellLine plot info
+    methy_data$cellLinePlot <- methy_data$cellLine
+    methy_data[methy_data$cellLine=="MEF1p"]$cellLinePlot <- "p"
+    methy_data[methy_data$cellLine=="MEF2p"]$cellLinePlot <- "p"
+    methy_data$cellLinePlot <- gsub("MEF2_", "", methy_data$cellLinePlot)
+    methy_data$cellLinePlot <- gsub("MEF1_", "", methy_data$cellLinePlot)
+    return(methy_data)
+}
+
+## Function to calculate fidelity score
+calculate_fidelity.score <- function(methy_data) {
+  methy_fidelity_clones <- methy_data %>% 
+    as.data.frame() %>% 
+    filter(!grepl("p", cellLine)) %>%
+    mutate(methyState = cut(methyPercent, breaks=c(0,10,40,60,90,100), include.lowest=TRUE),
+           methyState.faithful = methyState %in% c("[0,10]","(40,60]","(90,100]") | methyPercent == 40 | methyPercent == 90) %>%
+    group_by(seqnames, start) %>% 
+    summarise(fidelity.score = sum(methyState.faithful==TRUE)/14) 
+  methy_data$fidelity.score <-  methy_fidelity_clones$fidelity.score
+  return(methy_data)
+}
+
+
+## Function calculate neighbor similarity score
+  # Short function to split GR by column for the calculation
+gr.split.by.col <- function(gr, col_name) {
+	sapply(unique(mcols(gr)[,col_name]), function(n) gr[mcols(gr)[,col_name]==n], simplify=FALSE, USE.NAMES=TRUE)
+}
+
+calculate_neighbor_similarity.score <-  function(methy_data) {
+  methy_data.dist2nearest <- distanceToNearest(MEF_cpgs.gr)
+  methy_data.list <- gr.split.by.col(methy_data, "cellLine")
+  # Make empty list to fill using for loop below
+  methy_data.list.distance <- list()
+  
+  for(dataset in methy_data.list) {
+    dataset.df <- as.data.frame(dataset)
+    dataset.df <-  mutate(dataset.df, 
+                        distance = as.data.frame(methy_data.dist2nearest)$distance,
+                        methyDiff = dataset[subjectHits(methy_data.dist2nearest)]$methyPercent - dataset[queryHits(methy_data.dist2nearest)]$methyPercent,
+                        absMethyChange = abs(methyDiff),
+                        nearestCpG_similarity = ifelse(absMethyChange <= 10 , TRUE, FALSE))
+    methy_data.list.distance <- c(methy_data.list.distance, list(dataset.df))
+  }
+  
+  # Calculate score: number of times the nearest CpG is within 10% methylation / the total number of clones (14)
+  methy_data.similarity.score <- methy_data.list.distance %>% 
+    bind_rows() %>%
+    filter(!grepl("p", cellLine)) %>%
+    group_by(seqnames, start, end, distance) %>%
+    summarise(neighbor.similarity.score = sum(nearestCpG_similarity == TRUE) / 14) %>%
+    GRanges()
+  
+  # Add score to methy data
+  
+  similarity.score.overlap <- findOverlaps(methy_data, methy_data.similarity.score)
+  methy_data$neighbor.similarity.score <-  NA
+  methy_data[queryHits(similarity.score.overlap)]$neighbor.similarity.score <- methy_data.similarity.score[subjectHits(similarity.score.overlap)]$neighbor.similarity.score
+  return(methy_data)
+}
+
+
+
+## Function to calculate the number of CpGs within 100bp
+calculate_cpgs_within_100bp <- function(methy_data) {
+    methy_data.100bp_flank <- MEF_cpgs.gr + 100
+  # Get CpG counts from mm10 corresponding to methy_data CpGs
+  methy_data.100bp_flank.cpgCount <- findOverlaps(methy_data.100bp_flank, mm10CpG.fixed) %>%
+    queryHits() %>% 
+    table() %>%
+    as.data.frame(stringsAsFactors = FALSE)
+  
+  # Adding CpG counts to methy_data
+  methy_data.100bp_flank$cpgCounts.100bp <- 0 
+  methy_data.100bp_flank[as.numeric(methy_data.100bp_flank.cpgCount$.)]$cpgCounts.100bp <- methy_data.100bp_flank.cpgCount$Freq
+  
+  methy_data.cpgCount.overlap <- findOverlaps(methy_data, methy_data.100bp_flank)
+  methy_data$cpgCounts.100bp <- 0
+  methy_data[queryHits(methy_data.cpgCount.overlap)]$cpgCounts.100bp <- methy_data.100bp_flank[subjectHits(methy_data.cpgCount.overlap)]$cpgCounts.100bp
+  
+  return(methy_data)
+}
+
+
+## Function to calculate peak overlaps of ChIP-seq datasets
+peak_overlap <- function(methy_data, peaks, peak_name) {
+  methy_peak.overlap <- findOverlaps(methy_data, peaks)
+  mcols(methy_data)[peak_name] <- FALSE
+  mcols(methy_data)[queryHits(methy_peak.overlap),peak_name] <- TRUE
+  return(methy_data)
+}
+
+
+## Add all information to CpG GRanges object
+
+MEF_methy_cpg_tenx.gr_chrRemoved <- add_clusters_to_cpgs(MEF_methy_cpg_tenx.gr_chrRemoved, MEF_methy_cpg_tenx.gr_chrRemoved.matrix.clara)
+MEF_methy_cpg_tenx.gr_chrRemoved <- add_cellsample_info_for_plotting(MEF_methy_cpg_tenx.gr_chrRemoved)
+MEF_methy_cpg_tenx.gr_chrRemoved <- calculate_fidelity.score(MEF_methy_cpg_tenx.gr_chrRemoved)
+MEF_methy_cpg_tenx.gr_chrRemoved <- calculate_neighbor_similarity.score(MEF_methy_cpg_tenx.gr_chrRemoved)
+MEF_methy_cpg_tenx.gr_chrRemoved <- calculate_cpgs_within_100bp(MEF_methy_cpg_tenx.gr_chrRemoved)
+MEF_methy_cpg_tenx.gr_chrRemoved <- peak_overlap(MEF_methy_cpg_tenx.gr_chrRemoved, cpgIslands.unmasked.gr, "cpgIslands")
+MEF_methy_cpg_tenx.gr_chrRemoved <- peak_overlap(MEF_methy_cpg_tenx.gr_chrRemoved, h3k4me3.ChIP_seq.e13.5limb.gr, "H3K4me3")
+MEF_methy_cpg_tenx.gr_chrRemoved <- peak_overlap(MEF_methy_cpg_tenx.gr_chrRemoved, h3k9ac.ChIP_seq.e13.5limb.gr, "H3K9ac")
+MEF_methy_cpg_tenx.gr_chrRemoved <- peak_overlap(MEF_methy_cpg_tenx.gr_chrRemoved, h3k27ac.ChIP_seq.e13.5limb.gr, "H3K27ac")
+MEF_methy_cpg_tenx.gr_chrRemoved <- peak_overlap(MEF_methy_cpg_tenx.gr_chrRemoved, h3k36me3.ChIP_seq.e13.5limb.gr, "H3K36me3")
+MEF_methy_cpg_tenx.gr_chrRemoved <- peak_overlap(MEF_methy_cpg_tenx.gr_chrRemoved, h3k27me3.ChIP_seq.e13.5limb.gr, "H3K27me3")
+MEF_methy_cpg_tenx.gr_chrRemoved <- peak_overlap(MEF_methy_cpg_tenx.gr_chrRemoved, h3k9me3.ChIP_seq.e13.5limb.gr, "H3K9me3")
+
+
+## 28/1/22 - adding genomic region data with following ranking TEs > genic regions > intergenic
+
+# be careful because using GRanges made later in document!
+
+MEF.transcription.summary.gr <- MEF.region.comprehensive %>% 
+  group_by(seqnames, start, end, element.id) %>%
+  summarise(mean_rlog = mean(value)) %>%
+  GRanges()
+
+#making "transcription group" quintiles
+MEF.transcription.summary.gr$transcription.quintile <- cut(MEF.transcription.summary.gr$mean_rlog, breaks=quantile(MEF.transcription.summary.gr$mean_rlog, seq(0,1,0.2)), include.lowest = TRUE)
+
+
+MEF_methy_transcription.overlap <- findOverlaps(MEF_methy_cpg_tenx.gr_chrRemoved, unfiltered_genes.rlog.gr.fixed)
+MEF_methy_transcription.overlap <- findOverlaps(MEF_methy_cpg_tenx.gr_chrRemoved, resize(unfiltered_genes.rlog.gr.fixed, width=width(unfiltered_genes.rlog.gr.fixed) + 1000, fix="end"))
+
+MEF_methy_cpg_tenx.gr_chrRemoved$transcription.quintile <-"Intergenic"
+MEF_methy_cpg_tenx.gr_chrRemoved[queryHits(MEF_methy_transcription.overlap)]$transcription.quintile <-  unfiltered_genes.rlog.gr.fixed[subjectHits(MEF_methy_transcription.overlap)]$transcription.quintile
+MEF_methy_cpg_tenx.gr_chrRemoved$transcription.quintile <- factor(MEF_methy_cpg_tenx.gr_chrRemoved$transcription.quintile, levels=c( "Intergenic", "1", "2", "3" ,"4", "5" ))
+
+
+```
+
+
+## Load and prep RNA-seq data
+```{r data.import, message=FALSE}
+
+library(tximport)
+library(DESeq2)
+#library(tidyverse) - already loaded
+library(biomaRt)
+
+# Set up salmon
+
+sampleinfo <- read_tsv("/data/agilent/MEF_clones/RNA-seq/mapped/salmon_output/samplesheet.tsv", col_types=c("cccc"))
+salmon_files <- str_c("/data/agilent/MEF_clones/RNA-seq/mapped/salmon_output/", sampleinfo$FileName, "/quant.sf")
+salmon_files <- set_names(salmon_files, sampleinfo$SampleName)
+
+
+# Fetch Gene Annotation -----
+
+# get gene annotation - this was mapped to GRCm38 assembly
+mart <- useEnsembl(biomart = "ENSEMBL_MART_ENSEMBL", dataset = "mmusculus_gene_ensembl",
+                   host="nov2020.archive.ensembl.org")
+
+
+
+# gene information
+gene_annot <- getBM(attributes = c("ensembl_gene_id",
+                                   "chromosome_name","strand",
+                                   "start_position", "end_position",
+                                   "external_gene_name",
+                                   "percentage_gene_gc_content",
+                                   "gene_biotype"),
+                    mart = mart)
+gene_annot <- rename(gene_annot, stranded="strand")
+# move gene ID to rownames (useful to add to DESeq object below)
+rownames(gene_annot) <- gene_annot$ensembl_gene_id
+gene_annot$ensembl_gene_id <- NULL
+# get correspondence between transcript and gene names 
+tx2gene <- getBM(attributes = c("ensembl_transcript_id", "ensembl_gene_id"),
+                 mart = mart)
+
+#tx2gene <- read_tsv("/data/salmon_indices/transcript2gene.tsv")
+
+# Create DESeq object -----
+
+# import salmon counts
+txi <- tximport(salmon_files, 
+                type = "salmon",
+                tx2gene = tx2gene)
+
+
+# create DESeqDataSet - we set a design with no explanatory variables 
+dds <- DESeqDataSetFromTximport(txi,
+                                colData = sampleinfo,
+                                design = ~ 1)
+
+
+# add the rowData - we make sure the gene_annot table is sorted in the right order
+rowData(dds) <- gene_annot[rownames(dds), ]
+
+
+
+# Processing data - no filtering so as to include unexpressed genes in subsequent analyses
+
+## Prepping gene info
+genes.gr <- rowData(dds)
+
+genes.gr$gene_id <- rownames(genes.gr)
+
+genes.gr <- with(genes.gr, GRanges(seqnames=chromosome_name, 
+                        IRanges(start=start_position, 
+                                end=end_position), 
+                        strand=stranded, 
+                        gene_id=gene_id, 
+                        gene_biotype=gene_biotype))
+
+seqlevelsStyle(genes.gr) <- "UCSC"
+
+genes.protein_coding.gr <- as.data.frame(genes.gr) %>%
+  filter(gene_biotype=="protein_coding") %>%
+  GRanges()
+
+## Get "rlog" expression values 
+assay(dds, "rlog") <- rlog(counts(dds), blind = TRUE)
+
+rlog.genes.unfiltered.gr <- assays(dds)$rlog %>% as.data.frame()
+
+rlog.genes.unfiltered.gr$gene_id <- rownames(rlog.genes.unfiltered.gr)
+
+rlog.genes.unfiltered.gr <- pivot_longer(rlog.genes.unfiltered.gr, cols=starts_with("MEF"), names_to = "cellLine")
+
+#same for raw counts
+counts.genes.unfiltered.gr <- assay(dds, "counts") %>% as.data.frame() 
+counts.genes.unfiltered.gr$gene_id <- rownames(counts.genes.unfiltered.gr)
+counts.genes.unfiltered.gr <- pivot_longer(counts.genes.unfiltered.gr, cols=starts_with("MEF"), names_to = "cellLine")
+counts.genes.unfiltered.gr <- rename(counts.genes.unfiltered.gr, counts=value)
+ 
+## Make GRanges for rlog expression data per gene per cell line
+# ".fixed" is with ADDING 1000bp prior to the start site of every gene to account for promoters
+
+unfiltered_genes.rlog.gr <- left_join(as.data.frame(genes.gr), rlog.genes.unfiltered.gr) %>% GRanges()
+unfiltered_genes.rlog.gr.fixed <- left_join(as.data.frame(genes.protein_coding.gr), rlog.genes.unfiltered.gr) %>% GRanges()
+
+unfiltered_genes.rlog.gr.fixed <- as.data.frame(unfiltered_genes.rlog.gr.fixed) %>% mutate(cellType = substr(cellLine, 1, 4))
+
+unfiltered_genes.rlog.gr.fixed <- left_join(as.data.frame(unfiltered_genes.rlog.gr.fixed), counts.genes.unfiltered.gr)  %>% group_by(gene_id, transcription.quintile) %>% mutate(meanCount = mean(counts)) %>% ungroup() %>% GRanges()
+
+unfiltered_genes.rlog.gr.fixed <- as.data.frame(unfiltered_genes.rlog.gr.fixed) %>% 
+  group_by(seqnames, start, end, strand, gene_id, cellType) %>% 
+  mutate(avg.type.rlog = mean(value)) %>% 
+  group_by(seqnames, start, end, strand, gene_id) %>% 
+  mutate(avg.rlog = mean(value), var.rlog = var(value)) %>%
+  GRanges()
+
+unfiltered_genes.rlog.gr.fixed <- as.data.frame(unfiltered_genes.rlog.gr.fixed) %>%
+  group_by(seqnames, start, end, strand, gene_id) %>%
+  mutate(var.counts = var(counts)) %>%
+  ungroup() %>%
+  GRanges()
+
+
+```
+
+
+## Making expression levels (transcription.quintile) and evaluating - MEF RNA-seq
+``` {r transcription.quintiles.MEF.RNAseq}
+# Extended Data Figure 4
+
+# Make transcription quintile - not sure if this is the correct place for this to happen!
+unfiltered_genes.rlog.gr.fixed$transcription.quintile <- cut(unfiltered_genes.rlog.gr.fixed$avg.rlog, 
+                                                            breaks=unique(quantile(unfiltered_genes.rlog.gr.fixed$avg.rlog, seq(0,1,0.2))), 
+                                                            include.lowest = TRUE)
+##
+
+gene_levels_stacked_bar.plot <- unfiltered_genes.rlog.gr.fixed %>% 
+  as.data.frame() %>% 
+  group_by(gene_id, transcription.quintile) %>%
+  summarise() %>% 
+  ggplot() + 
+  geom_bar(aes(fill=transcription.quintile, x=1), position=position_fill(reverse=T)) + 
+  scale_fill_viridis_d() + 
+  theme_minimal() + 
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        text=element_text(colour="black", size=9),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5),
+        axis.title.x = element_blank()) +
+  guides(fill=guide_legend(title="Transcription levels")) +
+  scale_y_continuous(expand = c(0,0)) +
+  ylab("Proportion of \n protein-coding genes") 
+
+ggsave("gene_levels_stacked_bar.plot.pdf", gene_levels_stacked_bar.plot, height=2, width=3, useDingbats=FALSE)
+
+
+gene_read_counts_box.plot <- as.data.frame(unfiltered_genes.rlog.gr.fixed) %>% 
+  group_by(gene_id, transcription.quintile, meanCount) %>%
+  summarise() %>% 
+  filter(meanCount <20000) %>%
+  ggplot() + 
+  geom_boxplot(aes(y=meanCount, fill=transcription.quintile)) +
+  facet_wrap(~transcription.quintile, scales="free", nrow=1) +
+  scale_fill_viridis_d() + 
+  theme_minimal() +
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        text=element_text(colour="black", size=9.5),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5),
+        legend.position="none") +
+  guides(fill=guide_legend(title="Gene expression variance")) +
+  ylab("Average read counts") +
+  xlab("Transcription levels")
+
+ggsave("gene_read_counts_box.plot.pdf", gene_read_counts_box.plot, height=2, width=5, useDingbats=FALSE)
+
+gene_levels_hist.plot <- unfiltered_genes.rlog.gr.fixed %>% 
+  as.data.frame() %>% 
+  group_by(gene_id, avg.rlog, transcription.quintile) %>% 
+  summarise() %>% 
+  ggplot() + 
+  geom_histogram(aes(x=avg.rlog, fill=transcription.quintile), alpha=0.8, binwidth=0.5, center=0.25) + 
+  #facet_wrap(~transcription.quintile, scales="free_y", nrow=1) +
+  scale_fill_viridis_d() +
+  theme_minimal() + 
+  theme(axis.ticks = element_line(colour="black", size=0.5),
+        text=element_text(colour="black", size=9),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5),
+        legend.position = "none") +
+  guides(fill=guide_legend(title="Transcription levels")) +
+  scale_y_continuous(expand = c(0,0)) +
+  ylab("Counts of protein-coding genes") +
+  xlab("Average gene expression (Rlog)")
+
+ggsave("gene_levels_hist.plot.pdf", gene_levels_hist.plot, height=2, width=4, useDingbats=FALSE)
+
+
+
+```
+
+
+## Get cannonical transcript to gene using RNA-seq data and knownCanonical list from UCSC
+``` {r canonical.transcript}
+
+# get canonical transcripts from UCSC/Gencode
+# https://hgdownload.soe.ucsc.edu/goldenPath/mm10/database/knownCanonical.txt.gz
+
+knownCanonical.gr <- read_tsv("/data/genomes/mm10/annotation/knownCanonical.txt", col_names = FALSE)
+knownCanonical.gr$X5 <- gsub("\\..*", "", knownCanonical.gr$X5)
+knownCanonical.gr$X6 <- gsub("\\..*", "", knownCanonical.gr$X6)
+knownCanonical.gr <- with(knownCanonical.gr, GRanges(X1, IRanges(start=X2, end=X3), ensembl_transcript_id=X5, ensembl_gene_id=X6))
+
+# getting "primary transcripts" from my RNA-seq
+
+## transcript information
+transcript_annot <- getBM(attributes = c("ensembl_transcript_id",
+                                   "chromosome_name","strand",
+                                   "transcript_start", "transcript_end",
+                                   "ensembl_gene_id",
+                                   "gene_biotype"),
+                    mart = mart)
+transcript_annot <- rename(transcript_annot, stranded="strand")
+
+## move transcipt ID to rownames (useful to add to DESeq object below)
+rownames(transcript_annot) <- transcript_annot$ensembl_transcript_id
+transcript_annot$ensembl_transcript_id <- NULL
+
+txi.transcript <- tximport(salmon_files, 
+                type = "salmon",
+                txOut = TRUE)
+
+dds.transcript <- DESeqDataSetFromTximport(txi.transcript,
+                                colData = sampleinfo,
+                                design = ~ 1)
+
+rowData(dds.transcript) <- transcript_annot[rownames(dds.transcript), ]
+
+## Filter out genes that have 0 reads in more than 10 samples
+dds.transcript <- dds.transcript[rowSums(DESeq2::counts(dds.transcript)>0) > 10, ]
+
+dds.transcript <- DESeq(dds.transcript)
+
+dds.transcript.results.df <- results(dds.transcript) %>% as.data.frame()
+dds.transcript.results.df$ensembl_transcript_id <- rownames(dds.transcript.results.df)
+dds.transcript.results.df <- left_join(dds.transcript.results.df, tx2gene)
+dds.primary_transcript.df <- dds.transcript.results.df %>% group_by(ensembl_gene_id) %>% filter(baseMean == max(baseMean))
+RNA_seq_derived_canonical_transcripts <- dds.primary_transcript.df %>% select(ensembl_transcript_id, ensembl_gene_id)
+
+RNA_seq_derived_canonical_transcripts.gr <- transcript_annot[rownames(transcript_annot) %in% RNA_seq_derived_canonical_transcripts$ensembl_transcript_id, ] %>% select(chromosome_name, transcript_start, transcript_end, ensembl_gene_id)
+RNA_seq_derived_canonical_transcripts.gr$ensembl_transcript_id <- rownames(RNA_seq_derived_canonical_transcripts.gr)
+rownames(RNA_seq_derived_canonical_transcripts.gr) <- NULL
+
+RNA_seq_derived_canonical_transcripts.gr <- GRanges(RNA_seq_derived_canonical_transcripts.gr)
+seqlevelsStyle(RNA_seq_derived_canonical_transcripts.gr) <- "UCSC"
+
+canonical_transcripts.gr <- c(knownCanonical.gr[!(knownCanonical.gr$ensembl_gene_id %in% RNA_seq_derived_canonical_transcripts.gr$ensembl_gene_id), ], RNA_seq_derived_canonical_transcripts.gr) 
+
+canonical_transcripts.gr <- as.data.frame(canonical_transcripts.gr) %>% mutate(gene.transcript.id = paste0(ensembl_gene_id, ".", ensembl_transcript_id)) %>% GRanges() #Make unique ID matching gene and transcript IDs because transcript IDs are (surprisingly!) not unique to each gene
+
+
+```
+
+## Making ensembl region annotations based on transcription data (choosing 1st exons based on primary isoforms [see previous section])
+``` {r annotations.transcription}
+
+# Load ensembl annotations from bioMart
+
+ensembl.mm10 <- getBM(attributes = c("ensembl_gene_id",
+                                     "ensembl_transcript_id",
+                     "chromosome_name",
+                     "strand",
+                     "start_position", 
+                     "end_position",
+                     "rank",
+                     "exon_chrom_start",
+                     "exon_chrom_end",
+                     "gene_biotype"),
+      mart = mart)
+
+ensembl.mm10 <- ensembl.mm10 %>% mutate(strand = ifelse(strand==1, "+" , "-")) # Make strand column standardised for GRanges
+ensembl.mm10 <- ensembl.mm10 %>% filter(chromosome_name %in% c(1:19, "X")) # Keep annotations only for canonical chromosomes
+
+#Filter for canonical transcript - (from RNA-seq and knownCanonical) - now there should be 1 transcript per gene
+
+ensembl.mm10 <- as.data.frame(ensembl.mm10) %>% 
+  mutate(gene.transcript.id = paste0(ensembl_gene_id, ".", ensembl_transcript_id))  #Make unique ID matching gene and transcript IDs because transcript IDs are (surprisingly!) not unique to each gene
+ensembl.mm10 <- ensembl.mm10[ensembl.mm10$gene.transcript.id %in% as.data.frame(canonical_transcripts.gr)$gene.transcript.id,] 
+
+# Function to finish prepping genic region granges
+prep.genic.region.gr <- function(region.gr) {
+  seqlevelsStyle(region.gr) <- "UCSC" # E.g. makes "1" to "chr1"
+  region.gr <- as.data.frame(region.gr) %>% 
+    rename(., gene_id="ensembl_gene_id") %>%
+    mutate(element.id = paste0(seqnames, ":", start, "-", end)) %>% 
+    GRanges()
+  return(region.gr)
+}
+
+## promoters
+ensembl_promoter.gr <- ensembl.mm10 %>% 
+  group_by(ensembl_gene_id) %>%
+  mutate(count=n()) %>%
+  group_by(ensembl_gene_id, gene_biotype, strand, chromosome_name, start_position, end_position, count) %>% 
+  summarise() %>%
+  mutate(start_position = ifelse(strand=="-", end_position, start_position),
+         promoterStart = ifelse(strand=="+", start_position-1000, start_position+1000),
+         start = ifelse(strand=="+", promoterStart, start_position),
+         end = ifelse(strand=="+", start_position, promoterStart)) %>%
+  ungroup() %>%
+  filter(gene_biotype=="protein_coding", count!=1) %>%
+  dplyr::select(chromosome_name, strand, start, end, ensembl_gene_id, gene_biotype) %>%
+  GRanges()
+ensembl_promoter.gr <- prep.genic.region.gr(ensembl_promoter.gr)
+
+## all exons
+ensembl_exon.protein_coding.gr <- ensembl.mm10 %>% 
+  group_by(ensembl_gene_id) %>% 
+  mutate(count=n()) %>% 
+  ungroup() %>% 
+  filter(gene_biotype=="protein_coding") %>% # including "unitary" protein coding genes (there are very few!)
+  dplyr::select(chromosome_name, strand, exon_chrom_start, exon_chrom_end, ensembl_gene_id, gene_biotype, count, rank) %>%
+  GRanges()
+ensembl_exon.protein_coding.gr <- prep.genic.region.gr(ensembl_exon.protein_coding.gr)
+
+## 1st exons
+ensembl_1st_exon.protein_coding.gr <- ensembl.mm10 %>% 
+  group_by(ensembl_gene_id) %>% 
+  mutate(count=n()) %>% 
+  ungroup() %>% 
+  filter(count > 1, rank==1, gene_biotype=="protein_coding") %>% # Not including "unitary" protein coding genes (there are very few!)
+  dplyr::select(chromosome_name, strand, exon_chrom_start, exon_chrom_end, ensembl_gene_id, gene_biotype, rank, count) %>%
+  GRanges()
+ensembl_1st_exon.protein_coding.gr <- prep.genic.region.gr(ensembl_1st_exon.protein_coding.gr)
+
+## 2nd exons
+ensembl_2nd_exon.protein_coding.gr <- ensembl.mm10 %>% 
+  group_by(ensembl_gene_id) %>% 
+  mutate(count=n()) %>% 
+  ungroup() %>% 
+  filter(count > 1, rank==2, gene_biotype=="protein_coding") %>% # Not including "unitary" protein coding genes (there are very few!)
+  dplyr::select(chromosome_name, strand, exon_chrom_start, exon_chrom_end, ensembl_gene_id, gene_biotype, rank, count) %>%
+  GRanges()
+ensembl_2nd_exon.protein_coding.gr <- prep.genic.region.gr(ensembl_2nd_exon.protein_coding.gr)
+
+## 3rd exons
+ensembl_3rd_exon.protein_coding.gr <- ensembl.mm10 %>% 
+  group_by(ensembl_gene_id) %>% 
+  mutate(count=n()) %>% 
+  ungroup() %>% 
+  filter(count > 1, rank==3, gene_biotype=="protein_coding") %>% # Not including "unitary" protein coding genes (there are very few!)
+  dplyr::select(chromosome_name, strand, exon_chrom_start, exon_chrom_end, ensembl_gene_id, gene_biotype, rank, count) %>%
+  GRanges()
+ensembl_3rd_exon.protein_coding.gr <- prep.genic.region.gr(ensembl_3rd_exon.protein_coding.gr)
+
+## Exon rank 4 or higher - not last
+ensembl_rest_exon.protein_coding.gr <- ensembl.mm10 %>% 
+  group_by(ensembl_gene_id) %>% 
+  mutate(count=n()) %>% 
+  ungroup() %>% 
+  filter(count > 1, rank > 3, rank!=count, gene_biotype=="protein_coding") %>% # Not including "unitary" protein coding genes (there are very few!)
+  dplyr::select(chromosome_name, strand, exon_chrom_start, exon_chrom_end, ensembl_gene_id, gene_biotype, rank, count) %>%
+  GRanges()
+ensembl_rest_exon.protein_coding.gr <- prep.genic.region.gr(ensembl_rest_exon.protein_coding.gr)
+
+## last exons
+ensembl_last_exon.protein_coding.gr <- ensembl.mm10 %>% 
+    group_by(ensembl_gene_id) %>% 
+    mutate(count=n()) %>% 
+    ungroup() %>% 
+    filter(count >1, count==rank, gene_biotype=="protein_coding") %>% # Not including "unitary" protein coding genes (there are very few!)
+    dplyr::select(chromosome_name, strand, exon_chrom_start, exon_chrom_end, ensembl_gene_id, gene_biotype, rank, count) %>%
+    GRanges()
+ensembl_last_exon.protein_coding.gr <- prep.genic.region.gr(ensembl_last_exon.protein_coding.gr)
+
+
+## non1st exons
+ensembl_non1st_exon.protein_coding.gr <- ensembl.mm10 %>% 
+  group_by(ensembl_gene_id) %>% 
+  mutate(count=n()) %>% 
+  ungroup() %>% 
+  filter(count > 1, rank!=1, gene_biotype=="protein_coding") %>% 
+  dplyr::select(chromosome_name, strand, exon_chrom_start, exon_chrom_end, ensembl_gene_id, gene_biotype, rank) %>%
+  GRanges()
+ensembl_non1st_exon.protein_coding.gr <- prep.genic.region.gr(ensembl_non1st_exon.protein_coding.gr)
+
+## introns - first need to make ends and starts
+ensembl_intron_ends.df <- ensembl.mm10 %>% 
+  filter(gene_biotype=="protein_coding") %>%  
+  group_by(ensembl_gene_id, rank) %>% arrange(desc(rank), .by_group=TRUE) %>% 
+  select(ensembl_gene_id, exon_chrom_start, strand) %>% mutate(intron_end = exon_chrom_start) %>% 
+  group_by(ensembl_gene_id) %>% mutate(count = row_number(), n=n()) %>% 
+  filter(ifelse(strand=="+", !count==1, !count==n)) %>% 
+  select(ensembl_gene_id, intron_end, exon_chrom_start, strand) 
+
+ensembl_intron_starts.df <- ensembl.mm10 %>% 
+  filter(gene_biotype=="protein_coding") %>% 
+  group_by(ensembl_gene_id, rank) %>% 
+  arrange(desc(rank), .by_group=TRUE) %>% 
+  elect(ensembl_gene_id, exon_chrom_end, strand) %>% 
+  mutate(intron_start = exon_chrom_end) %>% 
+  group_by(ensembl_gene_id) %>% 
+  mutate(count = row_number(), n=n()) %>% 
+  filter(ifelse(strand=="+", !count==n, !count==1)) %>% 
+  select(ensembl_gene_id, intron_start, exon_chrom_end, strand)
+
+ensembl_introns.gr <- left_join(ensembl.mm10 %>% group_by(ensembl_gene_id) %>% 
+                                  mutate(count=n()) %>% 
+                                  ungroup() %>% 
+                                  filter(!count==1, gene_biotype=="protein_coding") %>%  
+                                  group_by(ensembl_gene_id, rank) %>% 
+                                  arrange(desc(rank), .by_group=TRUE) %>% 
+                                  ungroup() %>% 
+                                  select(chromosome_name, strand, ensembl_gene_id) %>% 
+                                  distinct(), 
+                                ensembl_intron_starts.df) %>% 
+  mutate(intron_start = ensembl_intron_starts.df$intron_start, intron_end = ensembl_intron_ends.df$intron_end) %>% 
+  select(chromosome_name, strand, intron_start, intron_end, ensembl_gene_id) %>%
+  GRanges()
+
+ensembl_introns.gr <- prep.genic.region.gr(ensembl_introns.gr)
+ensembl_introns.gr <- as.data.frame(ensembl_introns.gr) %>% 
+  group_by(gene_id) %>% mutate(rank=1:n(), count=n()) %>%
+  ungroup() %>% 
+  GRanges()
+
+ensembl_1st_intron.gr <- ensembl_introns.gr %>% as.data.frame() %>% filter(rank==1)  %>% GRanges()
+ensembl_2nd_intron.gr <- ensembl_introns.gr %>% as.data.frame() %>% filter(rank==2)  %>% GRanges()
+ensembl_3rd_intron.gr <- ensembl_introns.gr %>% as.data.frame() %>% filter(rank==3)  %>% GRanges()
+ensembl_rest_intron.gr <- ensembl_introns.gr %>% as.data.frame() %>% filter(rank > 3 & rank!=count)  %>% GRanges()
+ensembl_last_intron.gr <- ensembl_introns.gr %>% as.data.frame() %>% filter(count==rank)  %>% GRanges()
+ensembl_non1st_intron.gr <- ensembl_introns.gr %>% as.data.frame() %>% filter(!rank==1) %>% GRanges()
+
+
+## Dividing regions into "tiles"
+filter_GR_for_tiling <- function(region.gr, type_of_gr) {
+  region.gr <- region.gr %>% as.data.frame() %>% filter(width > 6
+                                                        #, rank < 11
+                                                        ) %>% GRanges()
+  return(region.gr)
+}
+
+
+
+ensembl_region.list <- GRangesList(ensembl_promoter.gr,
+                         ensembl_1st_exon.protein_coding.gr,
+                         ensembl_2nd_exon.protein_coding.gr,
+                         ensembl_3rd_exon.protein_coding.gr,
+                         ensembl_rest_exon.protein_coding.gr,
+                         ensembl_last_exon.protein_coding.gr,
+                         ensembl_1st_intron.gr,
+                         ensembl_2nd_intron.gr,
+                         ensembl_3rd_intron.gr,
+                         ensembl_rest_intron.gr,
+                         ensembl_last_intron.gr)
+
+names.regions <- c("promoter",
+                                "1st_exon",
+                                "2nd_exon", 
+                                "3rd_exon", 
+                                "rest_exon",
+                                "last_exon",
+                                "1st_intron",
+                                "2nd_intron",
+                                "3rd_intron",
+                                "rest_intron",
+                                "last_intron"
+)
+names(ensembl_region.list) <- names.regions
+
+
+ensembl_region.filtered.list <- lapply(seq_along(ensembl_region.list), function(i) filter_GR_for_tiling(ensembl_region.list[[i]]))
+names(ensembl_region.filtered.list) <- names.regions
+
+
+# add tile number (need to do it by strand!) 
+# from NJK
+gr.inside.tiles <- function(gr, inside.tile.n, keep.cols) {
+	# get tiles on the inside
+	inside.tiles <- unlist(tile(gr, n=inside.tile.n))
+	inside.tiles$pos <- unlist(lapply(
+		as.character(strand(gr))=="-",
+		function(minus) if (minus) (inside.tile.n-1):0 else 0:(inside.tile.n-1)
+	))
+	inside.tiles <- as.data.frame(inside.tiles) %>% mutate(pos=pos+1) %>% GRanges()
+	for (kc in keep.cols) {
+		if (kc %in% colnames(mcols(gr))) {
+			mcols(inside.tiles)[,kc] <- rep(mcols(gr)[,kc], each=inside.tile.n)
+		}
+	}
+	return(inside.tiles)
+	}
+
+# Function to add position/tiling id 
+add_pos_id <- function(tiled.gr) {
+  tiled.gr <- as.data.frame(tiled.gr) %>% 
+    mutate(pos.id = paste0(seqnames, ":", start, "-", end)) %>% 
+    GRanges()
+  return(tiled.gr)
+}
+
+ensembl_region.tiled5.list <- lapply(seq_along(ensembl_region.filtered.list), function(i) gr.inside.tiles(ensembl_region.filtered.list[[i]], 5, c("element.id", "rank", "count", "gene_id")))
+ensembl_region.tiled5.list <- lapply(seq_along(ensembl_region.tiled5.list), function(i) add_pos_id(ensembl_region.tiled5.list[[i]]))
+names(ensembl_region.tiled5.list) <- names.regions
+  
+# comprehensive ensembl - keep for intergenic vs genic overlaps
+
+ensembl_region.df.list <- list()
+
+for(region_name in names(ensembl_region.list)) {
+  ensembl_region.df <- as.data.frame(ensembl_region.list[[region_name]]) 
+  ensembl_region.df$region.type <- region_name
+  ensembl_region.df.list[[region_name]] <- ensembl_region.df
+}
+
+ensembl_region.comprehensive <- do.call(rbind, ensembl_region.df.list) %>% GRanges()
+
+ensembl_region.comprehensive$region.type <- factor(ensembl_region.comprehensive$region.type, levels=c("promoter", "1st_exon", "1st_intron", "2nd_exon",  "2nd_intron", "3rd_exon", "3rd_intron", "rest_exon", "rest_intron", "last_intron", "last_exon"), labels=c("Promoters", "1st exons", "1st introns", "2nd exons", "2nd introns", "3rd exons",   "3rd introns", "Rest of exons", "Rest of introns",  "Last introns", "Last exons"))  
+
+```
+
+
+## Prepping genic element-level data object for plotting heatmaps (e.g. for different annotations, such as promoters, exons, introns)
+``` {r avgMethy.avgFid.dfs}
+
+make_df_for_element_plotting <- function(methy_data, region.gr) {
+  methy_data_element <- subsetByOverlaps(methy_data, region.gr)
+  methy_data_element.overlap <- findOverlaps(methy_data_element, region.gr)
+  methy_data_element$element.id <- NA
+  methy_data_element[queryHits(methy_data_element.overlap)]$element.id <- region.gr[subjectHits(methy_data_element.overlap)]$element.id
+  methy_data_element$gene_id <- NA
+  methy_data_element[queryHits(methy_data_element.overlap)]$gene_id <- region.gr[subjectHits(methy_data_element.overlap)]$gene_id
+  methy_data_element$pos.id <- NA 
+  methy_data_element[queryHits(methy_data_element.overlap)]$pos.id <- region.gr[subjectHits(methy_data_element.overlap)]$pos.id
+  methy_data_element$pos <- NA 
+  methy_data_element[queryHits(methy_data_element.overlap)]$pos <- region.gr[subjectHits(methy_data_element.overlap)]$pos
+  methy_data_element <- as.data.frame(methy_data_element) %>% 
+    group_by(., cellLine, element.id, gene_id, pos.id, pos) %>% 
+    summarise(., avg.methy.element = mean(methyPercent), 
+            var.methy.element = var(methyPercent, na.rm=TRUE), 
+            avg.fid.element = mean(fidelity.score), 
+            number.cpg.in.element = n()
+            ) %>% 
+    ungroup() %>%
+    filter(., number.cpg.in.element > 0)
+  methy_data_element$cellType <- substr(methy_data_element$cellLine, 1, 4)
+  methy_data_element <- left_join(methy_data_element, as.data.frame(region.gr) %>% dplyr::select(seqnames, start, end, pos.id)) %>%
+      drop_na() %>%
+      GRanges()
+  # Adding expression data 
+  methy_data_element <- left_join(as.data.frame(methy_data_element), as.data.frame(unfiltered_genes.rlog.gr.fixed) %>%
+                                    dplyr::select(value,cellLine,gene_id,transcription.quintile), by = c("gene_id", "cellLine")) %>% 
+    GRanges()
+  methy_data_element <- methy_data_element %>% 
+    as.data.frame() %>% 
+    distinct() %>% 
+    GRanges()
+  return(methy_data_element)
+}
+
+# Making GRanges above with ensembl
+
+MEF.region.tiled5.list <- lapply(seq_along(ensembl_region.tiled5.list), function(i) make_df_for_element_plotting(MEF_methy_cpg_tenx.gr_chrRemoved, ensembl_region.tiled5.list[[i]]))
+
+
+```
+
+## Plotting lineplots by regions for methylation and fidelity
+``` {r lineplots.methy.fid}
+# Figure 3A and 3B / Extended Data Figure 6
+
+
+# Making lineplot of region methy
+names(MEF.region.list) <- names.regions
+
+MEF.region.df.list <- list()
+
+for(region_name in names(MEF.region.list)) {
+  MEF.region.df <- as.data.frame(MEF.region.list[[region_name]]) 
+  MEF.region.df$region.type <- region_name
+  MEF.region.df.list[[region_name]] <- MEF.region.df
+}
+
+MEF.region.comprehensive <- do.call(rbind, MEF.region.df.list)
+
+MEF.region.comprehensive$region.type <- factor(MEF.region.comprehensive$region.type, levels=c("promoter", "1st_exon", "1st_intron", "2nd_exon",  "2nd_intron", "3rd_exon", "3rd_intron", "rest_exon", "rest_intron", "last_intron", "last_exon"), labels=c("Promoters", "1st exons", "1st introns", "2nd exons", "2nd introns", "3rd exons",   "3rd introns", "Rest of exons", "Rest of introns",  "Last introns", "Last exons"))  
+
+
+#making "transcription group" quintiles
+#MEF.region.comprehensive$transcription.quintile <- cut(MEF.region.comprehensive$value, breaks=quantile(MEF.region.comprehensive$value, seq(0,1,0.2)), include.lowest = TRUE)
+#SEE ABOVE FOR MAKING TRANSCRIPTION QUINTILES (## Prepping CpG GRanges object for plotting heatmaps)
+
+#Need to first use "tiled" list so that I can plot the methylation "across" a region
+
+
+names(MEF.region.tiled5.list) <- names.regions
+
+MEF.region.tiled5.df.list <- list()
+
+for(region_name in names(MEF.region.tiled5.list)) {
+  MEF.region.tiled5.df <- as.data.frame(MEF.region.tiled5.list[[region_name]]) 
+  MEF.region.tiled5.df$region.type <- region_name
+  MEF.region.tiled5.df.list[[region_name]] <- MEF.region.tiled5.df
+}
+
+MEF.region.tiled.comprehensive <- do.call(rbind, MEF.region.tiled5.df.list)
+
+MEF.region.tiled.comprehensive$region.type <- factor(MEF.region.tiled.comprehensive$region.type, levels=c("promoter", "1st_exon", "1st_intron", "2nd_exon",  "2nd_intron", "3rd_exon", "3rd_intron", "rest_exon", "rest_intron", "last_intron", "last_exon"), labels=c("Promoters", "1st exons", "1st introns", "2nd exons", "2nd introns", "3rd exons",   "3rd introns", "Rest of exons", "Rest of introns",  "Last introns", "Last exons"))  
+
+#making numeric values for transcription quintule and region type for stats
+MEF.region.tiled.comprehensive$transcription.quintile.num <- factor(MEF.region.tiled.comprehensive$transcription.quintile, levels=c("[-2.28,0]", "(0,3.76]", "(3.76,9.96]", "(9.96,12]", "(12,21.2]"), labels=c(1,2,3,4,5))
+
+MEF.region.tiled.comprehensive$region.type.num <- NA
+MEF.region.tiled.comprehensive$region.type.num <- factor(MEF.region.tiled.comprehensive$region.type, levels=c("Promoters", "1st exons", "1st introns", "Rest of exons", "Rest of introns"), labels=c(1,2,3,4,5))
+
+#making "transcription group" quintiles
+#MEF.region.tiled.comprehensive$transcription.quintile <- cut(MEF.region.tiled.comprehensive$value, breaks=quantile(MEF.region.tiled.comprehensive$value, seq(0,1,0.2)), include.lowest = TRUE)
+
+
+MEF.region.tiled.comprehensive.summarised <- MEF.region.tiled.comprehensive %>% 
+  group_by(region.type, pos, transcription.quintile) %>% 
+  summarise(avg.methy.element = mean(avg.methy.element), avg.fid.element = mean(avg.fid.element)) 
+
+MEF.region.tiled.comprehensive.summarised <- MEF.region.tiled.comprehensive %>% 
+  group_by(region.type, pos, transcription.quintile) %>% 
+  summarise(methy.q50 = quantile(avg.methy.element, 0.5),
+            methy.q25 = quantile(avg.methy.element, 0.25),
+            methy.q75 = quantile(avg.methy.element, 0.75),
+            fid.q50 = quantile(avg.fid.element, 0.5),
+            fid.q25 = quantile(avg.fid.element, 0.25),
+            fid.q75 = quantile(avg.fid.element, 0.75)
+            )  %>% as.data.frame(stringsAsFactors=FALSE)
+
+
+MEF.region.methy.lineplot <- MEF.region.tiled.comprehensive.summarised %>% 
+  filter(!(region.type %in% c("2nd exons", "2nd introns", "3rd exons", "3rd introns", "Last introns", "Last exons"))) %>% #reduced
+  ggplot() + 
+  geom_ribbon(aes(ymin=methy.q25, ymax=methy.q75, x=pos, fill=transcription.quintile), alpha=0.3) +
+  geom_line(aes(y=methy.q50, x=pos, color=transcription.quintile), size=1) + 
+  facet_wrap(~region.type, nrow=1) + 
+  scale_fill_manual(values=c("#62336F", NA, NA, NA, "#FCED4F")) + 
+  scale_color_viridis_d(labels=c("Low", "", "", "", "High")) + 
+  theme_minimal() +
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        text=element_text(colour="black", size=9.5),
+        legend.position = "none",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5),
+        axis.title.x = element_blank()) +
+  #guides(fill=guide_legend(title="Gene expression")) +
+  ylab("Methylation (%)")  +
+  guides(color=guide_legend(title="Gene expression"),
+         fill=FALSE) 
+
+MEF.region.methy.FULL.lineplot <- MEF.region.tiled.comprehensive.summarised %>% 
+  ggplot() + 
+  geom_ribbon(aes(ymin=methy.q25, ymax=methy.q75, x=pos, fill=transcription.quintile), alpha=0.3) +
+  geom_line(aes(y=methy.q50, x=pos, color=transcription.quintile), size=1) + 
+  facet_wrap(~region.type, nrow=1) + 
+  scale_fill_manual(values=c("#62336F", NA, NA, NA, "#FCED4F")) + 
+  scale_color_viridis_d(labels=c("Low", "", "", "", "High")) + 
+  theme_minimal() +
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        text=element_text(colour="black", size=9.5),
+        legend.position = "none",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5),
+        axis.title.x = element_blank()) +
+  #guides(fill=guide_legend(title="Gene expression")) +
+  ylab("Methylation (%)")  +
+  guides(color=guide_legend(title="Gene expression"),
+         fill=FALSE) 
+
+
+MEF.region.fid.lineplot <- MEF.region.tiled.comprehensive.summarised %>% 
+  filter(!(region.type %in% c("2nd exons", "2nd introns", "3rd exons", "3rd introns", "Last introns", "Last exons"))) %>% #reduced
+  ggplot() + 
+  geom_ribbon(aes(ymin=fid.q25, ymax=fid.q75, x=pos, fill=transcription.quintile), alpha=0.3) +
+  geom_line(aes(y=fid.q50, x=pos, color=transcription.quintile), size=1) + 
+  facet_wrap(~region.type, nrow=1) + 
+  scale_fill_manual(values=c("#62336F", NA, NA, NA, "#FCED4F")) + 
+  scale_color_viridis_d(labels=c("Low", "", "", "", "High")) + 
+  theme_minimal() +
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        text=element_text(colour="black", size=9.5),
+        legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5),
+        axis.title.x = element_blank(),
+        strip.text.x = element_blank()) +
+  #guides(fill=guide_legend(title="Gene expression")) +
+  ylab("Fidelity score")  +
+  guides(color=guide_legend(title="Gene expression"),
+         fill=FALSE) +
+  ylim(0.6,1) #added this to combine with TE boxplots
+
+MEF.region.fid.FULL.lineplot <- MEF.region.tiled.comprehensive.summarised %>% 
+ # filter(!(region.type %in% c("2nd exons", "2nd introns", "3rd exons", "3rd introns", "Last introns", "Last exons"))) %>% #reduced
+  ggplot() + 
+  geom_ribbon(aes(ymin=fid.q25, ymax=fid.q75, x=pos, fill=transcription.quintile), alpha=0.3) +
+  geom_line(aes(y=fid.q50, x=pos, color=transcription.quintile), size=1) + 
+  facet_wrap(~region.type, nrow=1) + 
+  scale_fill_manual(values=c("#62336F", NA, NA, NA, "#FCED4F")) + 
+  scale_color_viridis_d(labels=c("Low", "", "", "", "High")) + 
+  theme_minimal() +
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        text=element_text(colour="black", size=9.5),
+        legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5),
+        axis.title.x = element_blank(),
+        strip.text.x = element_blank()) +
+  ylab("Fidelity score")  +
+  guides(color=guide_legend(title="Gene expression"),
+         fill=FALSE) +
+  ylim(0.6,1) #added this to combine with TE boxplots
+
+combined.lineplots <- MEF.region.methy.lineplot / MEF.region.fid.lineplot
+combined.FULL.lineplots <- MEF.region.methy.FULL.lineplot / MEF.region.fid.FULL.lineplot
+
+ggsave("combined.lineplots.reduced.png", combined.lineplots, width=4.5, height=3)
+ggsave("combined.lineplots.reduced.pdf", combined.lineplots, width=4.5, height=3)
+ggsave("combined.lineplots.FULL.reduced.pdf", combined.FULL.lineplots, width=9, height=3)
+
+
+```
+
+
+## Supplementary plots for heatmap
+``` {r supp.heatmap}
+
+library(ggpubr)
+
+
+MEF.cluster.cpgs$cluster <- factor(MEF.cluster.cpgs$cluster, levels=c("M", "MI", "I", "UI","U"))
+
+MEF_methy_cpg_tenx.gr_chrRemoved$clusterNamed <- as.character(factor(as.character(MEF_methy_cpg_tenx.gr_chrRemoved$cluster), levels=c("7","2","5","3","6","4","1"), labels=c("U", "M", "I", "UI", "UI", "MI", "MI")))
+
+MEF_methy_cpg_tenx.gr_chrRemoved$clusterNamed <- factor(MEF_methy_cpg_tenx.gr_chrRemoved$clusterNamed, levels=c("M", "MI", "I", "UI", "U"))
+
+#Extended Data Figure 3B
+supp_fig.methyDist.plot <- as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>% 
+  ggplot() + 
+  geom_histogram(aes(x=methyPercent, fill=clusterNamed, group=clusterNamed), center=1, binwidth =2) +
+  coord_cartesian(xlim=c(0, 100)) +
+  theme_minimal() + 
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+        axis.ticks.x = element_line(colour="black", size=0.5),
+        text=element_text(colour="black", size=7),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5),
+        strip.text.x = element_blank()) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_fill_manual(values=c("#3A62A6", "#98A4AE", "#FDF2A6", "#EE8657" ,"#CE1B1E")) +
+  xlab("Methylation (%)") +
+  ylab("CpG counts") +
+  facet_wrap(~clusterNamed, ncol=1, scales="free")
+ggsave("supp_fig.methyDist.plot.pdf", supp_fig.methyDist.plot, height=4, width=3.5)
+
+  
+MEF_methy_cpg_tenx.gr_chrRemoved$clusterNamed <- factor(MEF_methy_cpg_tenx.gr_chrRemoved$clusterNamed, levels=c("U", "UI", "I", "MI", "M"))
+
+#Extended Data Figure 3C
+supp_fig.density <- MEF_methy_cpg_tenx.gr_chrRemoved %>% 
+    as.data.frame() %>% 
+    group_by(seqnames, start, end, clusterNamed, cpgCounts.100bp) %>%
+    summarise() %>%
+    ggplot(aes(x=clusterNamed, y=cpgCounts.100bp, fill=clusterNamed, group=clusterNamed)) + 
+    geom_boxplot() +
+    theme_minimal() +
+    theme(axis.ticks.y = element_line(colour="black", size=0.5),
+          text=element_text(colour="black", size=7),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line = element_line(color="black", size=0.5),
+          legend.position = "none") +
+    scale_fill_manual(values=c("#CE1B1E", "#EE8657", "#FDF2A6", "#98A4AE", "#3A62A6")) +
+    xlab("Methylation cluster") +
+    ylab("CpG density") +
+    ylim(0,30)
+
+ggsave("supp_fig.density.pdf", supp_fig.density, height=2, width=2)
+
+#Extended Data Figure 3D
+supp_fig.fidelity <- MEF_methy_cpg_tenx.gr_chrRemoved %>% 
+    as.data.frame() %>% 
+    group_by(seqnames, start, end, clusterNamed, fidelity.score) %>%
+    summarise() %>% 
+    ggplot(aes(x=clusterNamed, y=fidelity.score, fill=clusterNamed, group=clusterNamed)) + 
+    geom_boxplot() +
+    theme_minimal() +
+    theme(axis.ticks.y = element_line(colour="black", size=0.5),
+          text=element_text(colour="black", size=7),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line = element_line(color="black", size=0.5),
+          legend.position = "none") +
+    scale_fill_manual(values=c("#CE1B1E", "#EE8657", "#FDF2A6", "#98A4AE", "#3A62A6")) +
+    xlab("Methylation cluster") +
+    ylab("Fidelity score") 
+
+#Extended Data Figure 3E 
+supp_fig.neighbour <- MEF_methy_cpg_tenx.gr_chrRemoved %>% 
+    as.data.frame() %>% 
+    group_by(seqnames, start, end, clusterNamed, neighbor.similarity.score) %>%
+    summarise() %>% 
+    ggplot() + 
+    geom_boxplot(aes(x=clusterNamed, y=neighbor.similarity.score, fill=clusterNamed)) +
+    theme_minimal() +
+    theme(axis.ticks.y = element_line(colour="black", size=0.5),
+          text=element_text(colour="black", size=7),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line = element_line(color="black", size=0.5),
+          legend.position = "none") +
+    scale_fill_manual(values=c("#CE1B1E", "#EE8657", "#FDF2A6", "#98A4AE", "#3A62A6")) +
+    xlab("Methylation cluster") +
+    ylab("Neighbour similarity score") 
+
+#Extended Data Figure 5B
+supp_fig.transcription <- MEF_methy_cpg_tenx.gr_chrRemoved %>% 
+    as.data.frame() %>% 
+    group_by(seqnames, start, clusterNamed, transcription.quintile) %>%
+    summarise() %>%
+    group_by(clusterNamed, transcription.quintile) %>% 
+    dplyr::count() %>% 
+    group_by(clusterNamed) %>%
+    mutate(prop_tq_in_cluster = n/sum(n)) %>% 
+    ggplot() + 
+    geom_bar(aes(x=clusterNamed, y=prop_tq_in_cluster, fill=clusterNamed), colour="black", stat="identity") + 
+    facet_wrap(~transcription.quintile, scales="free_y", nrow=1) +
+    theme_minimal() +
+    theme(axis.ticks.y = element_line(colour="black", size=0.5),
+          text=element_text(colour="black", size=7),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line = element_line(color="black", size=0.5),
+          legend.position = "none") +
+    scale_fill_manual(values=c("#CE1B1E", "#EE8657", "#FDF2A6", "#98A4AE", "#3A62A6")) +
+    scale_y_continuous(expand = c(0,0)) +
+    xlab("Methylation cluster") +
+    ylab("Proportion of CpGs in cluster") 
+
+ggsave("supp_fig.transcription.pdf", supp_fig.transcription, width=6, height=2)
+
+### statistics for comparing values (fidelity, density, and neighbour similarity) between methylation clusters
+
+MEF.cpgs.for.stats <- MEF_methy_cpg_tenx.gr_chrRemoved %>% 
+    as.data.frame() %>% 
+    group_by(seqnames, start, end, clusterNamed, fidelity.score, neighbor.similarity.score, cpgCounts.100bp) %>%
+    summarise() %>%
+    ungroup()
+
+# stats for fid score example: M vs MI
+wilcox.test(MEF.cpgs.for.stats %>% filter(clusterNamed=="M") %>% pull(fidelity.score) %>% as.numeric(), MEF.cpgs.for.stats %>% filter(clusterNamed=="MI") %>% pull(fidelity.score) %>% as.numeric())
+# every possible test yields pvalues < 2.22e-16...
+
+#stats for neighbor similarity score example: M vs. MI
+wilcox.test(MEF.cpgs.for.stats %>% filter(clusterNamed=="M") %>% pull(neighbor.similarity.score) %>% as.numeric(), MEF.cpgs.for.stats %>% filter(clusterNamed=="MI") %>% pull(neighbor.similarity.score) %>% as.numeric()  )
+# every possible test yields pvalues < 2.22e-16...
+
+#stats for density
+
+### making pie charts of region types vs. methylation groups (clusterNamed)
+MEF_cpgs_for_pie_chart.gr <- MEF_methy_cpg_tenx.gr_chrRemoved %>%
+  as.data.frame() %>%
+  group_by(seqnames, start, end, clusterNamed) %>% 
+  summarise() %>% 
+  ungroup() %>%
+  GRanges()
+
+MEF_cpgs_for_pie_chart.gr$promoter <- F
+MEF_cpgs_for_pie_chart.gr[queryHits(findOverlaps(MEF_cpgs_for_pie_chart.gr, ensembl_promoter.protein_coding.gr))]$promoter <- T
+MEF_cpgs_for_pie_chart.gr$exon <- F
+MEF_cpgs_for_pie_chart.gr[queryHits(findOverlaps(MEF_cpgs_for_pie_chart.gr, ensembl_exon.protein_coding.gr))]$exon <- T
+MEF_cpgs_for_pie_chart.gr$intron <- F
+MEF_cpgs_for_pie_chart.gr[queryHits(findOverlaps(MEF_cpgs_for_pie_chart.gr, ensembl_introns.gr))]$intron <- T
+MEF_cpgs_for_pie_chart.gr$TE <- F
+MEF_cpgs_for_pie_chart.gr[queryHits(findOverlaps(MEF_cpgs_for_pie_chart.gr, TEs.gr.fixed))]$TE <- T
+MEF_cpgs_for_pie_chart.gr$intergenic <- F
+MEF_cpgs_for_pie_chart.gr[MEF_cpgs_for_pie_chart.gr$promoter==F &
+                            MEF_cpgs_for_pie_chart.gr$exon==F &
+                            MEF_cpgs_for_pie_chart.gr$intron==F &
+                            MEF_cpgs_for_pie_chart.gr$TE==F]$intergenic <- T
+
+#Extended Data Figure 5A
+MEF_cpgs_region_type.plot <- MEF_cpgs_for_pie_chart.gr %>%
+  as.data.frame() %>% 
+  pivot_longer(c(promoter,exon,intron,TE,intergenic), names_to = "region_type", values_to = "region_type_binary") %>%
+  filter(region_type_binary == T) %>% 
+  ggplot() + 
+  geom_bar(aes(x=clusterNamed, fill=factor(region_type, levels=c("TE", "intergenic", "promoter","exon","intron"), labels=c("Transposable \n element", "Intergenic", "Promoter", "Exon", "Intron"))), position='fill') +
+  xlab("Methylation groups") +
+  ylab("Proportion of CpGs \n genomic region type") +
+  guides(fill=guide_legend(title="Region type")) +
+  theme_minimal() + 
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+        axis.ticks.x = element_line(colour="black", size=0.5),
+        text=element_text(colour="black", size=7),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5)) +
+      scale_y_continuous(expand = c(0,0)) + scale_x_discrete(expand = c(0,0)) 
+
+ggsave("MEF_cpgs_region_type.plot.pdf", MEF_cpgs_region_type.plot, width=3, height=2)
+
+MEF_cpgs_region_type.all.plot <- MEF_cpgs_for_pie_chart.gr %>%
+    as.data.frame() %>% 
+    pivot_longer(c(promoter,exon,intron,TE,intergenic), names_to = "region_type", values_to = "region_type_binary") %>%
+    filter(region_type_binary == T) %>% 
+    ggplot() + 
+    geom_bar(aes(x=1, fill=factor(region_type, levels=c("TE", "intergenic", "promoter","exon","intron"), labels=c("Transposable \n element", "Intergenic", "Promoter", "Exon", "Intron"))), position='fill') +
+    xlab("All tcBS-seq \n CpGs") +
+    ylab("Proportion of CpGs \n genomic region type") +
+    guides(fill=guide_legend(title="Region type")) +
+    theme_minimal() + 
+    theme(axis.ticks.y = element_line(colour="black", size=0.5),
+          axis.ticks.x = element_line(colour="black", size=0.5),
+          text=element_text(colour="black", size=7),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line = element_line(color="black", size=0.5)) +
+    scale_y_continuous(expand = c(0,0)) + scale_x_discrete(expand = c(0,0)) 
+
+ggsave("MEF_cpgs_region_type.all.plot.pdf", MEF_cpgs_region_type.all.plot, width=2, height=2)
+
+
+```
+
+
+## Plotting CpG level heatmaps
+
+``` {r cpg.heatmaps}
+## Function to plot heatmap of clustered methylation data of all samples
+plot_heatmap_methy <- function(methy_data) {
+  methy_data %>% 
+    as.data.frame() %>% 
+    dplyr::select(seqnames, start, end, methyPercent, cellLine, cellType, cluster, cellTypePlot, cellLinePlot) %>% 
+    mutate(cpg=paste(seqnames, start, sep=":")) %>% 
+    mutate(cpg=paste(cpg, end, sep="-")) %>%
+    dplyr::select(cpg, methyPercent, cellLine, cellType, cluster, cellTypePlot, cellLinePlot) %>%
+    mutate(cpg = fct_reorder(cpg, methyPercent, .fun='median')) %>%
+    ggplot(aes(x=cellLinePlot,y=cpg,fill=methyPercent)) +
+    geom_tile() +
+    scale_fill_gradientn(colours=c("#d73027", "#ffffbf","#4575b4"), guide = guide_colourbar(title = "Methylation (%)"), , breaks = c(0,50,100), labels=c("0","50","100")) +
+    facet_grid(vars(factor(cluster, levels=c(2, 4, 1, 5, 3, 6, 7))), vars(cellTypePlot), space="free", scales="free") +
+    theme_minimal() +
+    theme(axis.text.y=element_blank(),
+          axis.title.y=element_blank(),
+          text=element_text(size=45),
+          legend.position = "bottom",
+          legend.key.size = unit(2, "cm"),
+          strip.text = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          strip.background = element_blank(),
+          panel.border = element_blank(),
+          axis.line.y.left = element_blank()
+          ) +
+    xlab("")
+
+## Function to plot heatmap of fidelity score
+plot_heatmap_fidelity <- function(methy_data) {
+  methy_data %>% 
+    as.data.frame() %>% 
+    dplyr::select(seqnames, start, end, methyPercent, cellLine, cellType, cluster, fidelity.score) %>% 
+    mutate(cpg=paste(seqnames, start, sep=":")) %>% 
+    mutate(cpg=paste(cpg, end, sep="-")) %>%
+    dplyr::select(cpg, methyPercent, cellLine, cellType, cluster, fidelity.score) %>%
+    mutate(cpg = fct_reorder(cpg, methyPercent, .fun='median')) %>%
+    group_by(cpg, cluster, fidelity.score) %>%
+    summarise() %>% 
+    ggplot(aes(x=1, y=cpg, fill=fidelity.score)) +
+    geom_tile() +
+    scale_fill_gradientn(colours=c("#8f4d00","#e08214","white"), values=c(0,0.5,1), breaks=c(0,0.5,1), labels=c("0", "0.5", "1"), guide = guide_colourbar(title = "Fidelity score", title.position="top")) +
+    facet_grid(vars(factor(cluster, levels=c(2, 4, 1, 5, 3, 6, 7))), vars(1), space="free", scales="free") +
+    theme_minimal() +
+    theme(axis.text.y=element_blank(),
+          axis.text.x=element_blank(),
+          axis.title.y=element_blank(),
+          axis.title.x=element_blank(),
+          text=element_text(size=45),
+          legend.position = "bottom",
+          legend.key.size = unit(2, "cm"),
+          strip.text = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          strip.background = element_blank(),
+          panel.border = element_blank(),
+          axis.line.y.left = element_blank()
+          )
+}
+
+
+## Function to plot neighbor similarity score
+plot_heatmap_neighbor.score <- function(methy_data) {
+  methy_data %>% 
+    as.data.frame() %>% 
+    dplyr::select(seqnames, start, end, methyPercent, cellLine, cellType, cluster, neighbor.similarity.score) %>% 
+    mutate(cpg=paste(seqnames, start, sep=":")) %>% 
+    mutate(cpg=paste(cpg, end, sep="-")) %>%
+    dplyr::select(cpg, methyPercent, cellLine, cellType, cluster, neighbor.similarity.score) %>%
+    mutate(cpg = fct_reorder(cpg, methyPercent, .fun='median')) %>%
+    group_by(cpg, cluster, neighbor.similarity.score) %>%
+    summarise() %>% 
+    ggplot(aes(x=1, y=cpg, fill=neighbor.similarity.score)) +
+    geom_tile() +
+    scale_fill_gradient(low="#006b23", high="white", limits=c(0,1), breaks = c(0,0.5,1), labels=c("0","0.5","1"), guide = guide_colourbar(title = "Neighbor \n similarity score",title.position="top")) +
+    facet_grid(vars(factor(cluster, levels=c(2, 4, 1, 5, 3, 6, 7))), vars(1), space="free", scales="free") +
+    theme_minimal() +
+    theme(axis.text.y=element_blank(),
+          axis.text.x=element_blank(),
+          axis.title.y=element_blank(),
+          axis.title.x=element_blank(),
+          text=element_text(size=45),
+          legend.position="bottom",
+          legend.key.size = unit(2, "cm"),
+          strip.text = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          strip.background = element_blank(),
+          panel.border = element_blank(),
+          axis.line.y.left = element_blank()
+          ) 
+}
+
+## Function to plot number of CpGs within 100bp - no longer as a barplot, but as a heatmap tile plot
+plot_heatmap_cpgCounts100bp <- function(methy_data) {
+  methy_data %>% 
+    as.data.frame() %>% 
+    dplyr::select(seqnames, start, end, methyPercent, cellLine, cellType, cluster, cpgCounts.100bp) %>% 
+    mutate(cpg=paste(seqnames, start, sep=":")) %>% 
+    mutate(cpg=paste(cpg, end, sep="-")) %>%
+    dplyr::select(cpg, methyPercent, cellLine, cellType, cluster, cpgCounts.100bp) %>%
+    mutate(cpg = fct_reorder(cpg, methyPercent, .fun='median')) %>%
+    group_by(cpg, cluster, cpgCounts.100bp) %>%
+    summarise() %>% 
+    ggplot(aes(x=1, y=cpg, fill=cpgCounts.100bp)) +
+    geom_tile(stat="identity") +
+    scale_fill_gradient(low="white", high="#4c008f", limits=c(0,30), breaks=c(0,10,20,30), labels=c("0","10","20","30"), guide = guide_colourbar(title = "CpG Density", title.position = "top")) +
+    facet_grid(vars(factor(cluster, levels=c(2, 4, 1, 5, 3, 6, 7))), vars(1), space="free", scales="free") +
+    theme_minimal() +
+    theme(axis.text.y=element_blank(),
+          axis.text.x=element_blank(),
+          axis.title.y=element_blank(),
+          axis.title.x=element_blank(),
+          text=element_text(size=45),
+          legend.position="bottom",
+          legend.key.size = unit(2, "cm"),
+          strip.text = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          strip.background = element_blank(),
+          panel.border = element_blank(),
+          axis.line.y.left = element_blank()
+          ) 
+}
+
+## Function to plot genic regions ("Genic", "TEs", "Intergenic")
+
+                  
+plot_heatmap_genicRegionsTranscription <- function(methy_data) {
+  methy_data %>% 
+    as.data.frame() %>% 
+    dplyr::select(seqnames, start, end, methyPercent, cellLine, cellType, cluster, transcription.quintile) %>% 
+    mutate(cpg=paste(seqnames, start, sep=":")) %>% 
+    mutate(cpg=paste(cpg, end, sep="-")) %>%
+    dplyr::select(cpg, methyPercent, cellLine, cellType, cluster, transcription.quintile) %>%
+    mutate(cpg = fct_reorder(cpg, methyPercent, .fun='median')) %>%
+    group_by(cpg, cluster, transcription.quintile) %>%
+    summarise() %>% 
+    ggplot(aes(x=1, y=cpg, fill=transcription.quintile)) +
+    geom_tile(stat="identity") +
+    scale_fill_manual(values=c("white", "#62336F", "#505F91", "#3D9793", "#71B76C", "#FCED4F"), labels=c("Intergenic", "Low", "", "","", "High")) +
+    scale_alpha_manual() +
+    facet_grid(vars(factor(cluster, levels=c(2, 4, 1, 5, 3, 6, 7))), vars(1), space="free", scales="free") +
+    theme_minimal() +
+    theme(axis.text.y=element_blank(),
+          axis.text.x=element_blank(),
+          axis.title.y=element_blank(),
+          axis.title.x=element_blank(),
+          text=element_text(size=45),
+          legend.position="bottom",
+          legend.key.size = unit(2, "cm"),
+          legend.title = element_blank(),
+          legend.direction = "vertical", 
+          strip.text = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          strip.background = element_blank(),
+          panel.border = element_blank(),
+          axis.line.y.left = element_blank()
+          ) 
+}
+
+
+                  
+plot_heatmap_genicRegionsIntergenic <- function(methy_data) {
+  methy_data %>% 
+    as.data.frame() %>% 
+    dplyr::select(seqnames, start, end, methyPercent, cellLine, cellType, cluster, transcription.quintile) %>% 
+    mutate(cpg=paste(seqnames, start, sep=":")) %>% 
+    mutate(cpg=paste(cpg, end, sep="-")) %>%
+    dplyr::select(cpg, methyPercent, cellLine, cellType, cluster, transcription.quintile) %>%
+    mutate(cpg = fct_reorder(cpg, methyPercent, .fun='median')) %>%
+    group_by(cpg, cluster, transcription.quintile) %>%
+    summarise() %>% 
+    ggplot(aes(x=1, y=cpg, fill=transcription.quintile)) +
+    geom_tile(stat="identity") +
+    scale_fill_manual(values=c("black", "white", "white", "white", "white", "white"), labels=c("Intergenic", "", "", "","", "")) +
+    scale_alpha_manual() +
+    facet_grid(vars(factor(cluster, levels=c(2, 4, 1, 5, 3, 6, 7))), vars(1), space="free", scales="free")  +
+    theme_minimal() +
+    theme(axis.text.y=element_blank(),
+          axis.text.x=element_blank(),
+          axis.title.y=element_blank(),
+          axis.title.x=element_blank(),
+          text=element_text(size=45),
+          legend.position="bottom",
+          legend.key.size = unit(2, "cm"),
+          legend.title = element_blank(),
+          legend.direction = "vertical", 
+          strip.text = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          strip.background = element_blank(),
+          panel.border = element_blank(),
+          axis.line.y.left = element_blank()
+          ) 
+}
+
+
+#Figure 1C and D
+## Make and save heatmaps
+
+MEF_methy_cpg_tenx.gr_chrRemoved.methyClusters <- plot_heatmap_methy(MEF_methy_cpg_tenx.gr_chrRemoved)
+ggsave("MEF_methy_cpg_tenx.gr_chrRemoved.methyClusters.png", MEF_methy_cpg_tenx.gr_chrRemoved.methyClusters, width=30, height=30, limitsize=FALSE)
+
+MEF_methy_cpg_tenx.gr_chrRemoved.cpgCounts100bp <- plot_heatmap_cpgCounts100bp(MEF_methy_cpg_tenx.gr_chrRemoved)
+ggsave("MEF_methy_cpg_tenx.gr_chrRemoved.cpgCounts100bp.png", MEF_methy_cpg_tenx.gr_chrRemoved.cpgCounts100bp, width=5, height=30, limitsize=FALSE)
+
+MEF_methy_cpg_tenx.gr_chrRemoved.fidelity <- plot_heatmap_fidelity(MEF_methy_cpg_tenx.gr_chrRemoved)
+ggsave("MEF_methy_cpg_tenx.gr_chrRemoved.fidelity.png", MEF_methy_cpg_tenx.gr_chrRemoved.fidelity, width=5, height=30, limitsize=FALSE)
+
+MEF_methy_cpg_tenx.gr_chrRemoved.neighbor <- plot_heatmap_neighbor.score(MEF_methy_cpg_tenx.gr_chrRemoved)
+ggsave("MEF_methy_cpg_tenx.gr_chrRemoved.neighbor.png", MEF_methy_cpg_tenx.gr_chrRemoved.neighbor, width=5, height=30, limitsize=FALSE)
+
+MEF_methy_cpg_tenx.gr_chrRemoved.genicRegionsTranscription <- plot_heatmap_genicRegionsTranscription(MEF_methy_cpg_tenx.gr_chrRemoved)
+ggsave("MEF_methy_cpg_tenx.gr_chrRemoved.genicRegionsTranscription.png", MEF_methy_cpg_tenx.gr_chrRemoved.genicRegionsTranscription, width=5, height=30, limitsize=FALSE)
+
+MEF_methy_cpg_tenx.gr_chrRemoved.intergenic.heatmap<- plot_heatmap_genicRegionsIntergenic(MEF_methy_cpg_tenx.gr_chrRemoved)
+ggsave("MEF_methy_cpg_tenx.gr_chrRemoved.intergenic.heatmap.png", MEF_methy_cpg_tenx.gr_chrRemoved.intergenic.heatmap, width=5, height=30, limitsize=FALSE)
+
+```
+
+## Making UpSet interaction plots to show how methylation is maintained (stochastically or deterministically?)
+
+```{r upset.plots, message=FALSE}
+
+# Figure 4C and Extended Data Figure 9B
+
+library(UpSetR)
+
+# Making bins of methylation for use with UpSet plots
+
+MEF_methy_cpg_tenx.gr_chrRemoved <- as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>% 
+  mutate(methyGroupFive = cut(methyPercent, 
+                              breaks = c(0, 10, 40, 60, 90, 100),
+                              include.lowest = TRUE)) %>% 
+  GRanges()
+
+MEF_methy_cpg_tenx.gr_chrRemoved$methyGroupFive <- factor(MEF_methy_cpg_tenx.gr_chrRemoved$methyGroupFive, levels=c("[0,10]",  "(10,40]", "(40,60]", "(60,90]", "(90,100]"))  
+
+# Prepping list dfs with different parental methy states 
+names.methyGroupFive.MEF1 <- c( "(60,90]", "(90,100]", "(40,60]", "(10,40]", "[0,10]")
+MEF1p.methyGroup.list <- gr.split.by.col(MEF_methy_cpg_tenx.gr_chrRemoved[MEF_methy_cpg_tenx.gr_chrRemoved$cellLine=="MEF1p"], "methyGroupFive")
+names(MEF1p.methyGroup.list) <- names.methyGroupFive.MEF1
+
+MEF1_clones.methyGroup.list <- list() 
+for(methyGroupFive.name in names(MEF1p.methyGroup.list)) {
+  MEF1p.methy <- MEF1p.methyGroup.list[[methyGroupFive.name]]
+  MEF1_clones.methyGroup.mat <- subsetByOverlaps(MEF_methy_cpg_tenx.gr_chrRemoved, MEF1p.methy) %>%
+    as.data.frame() %>%
+    filter(cellType=="MEF1", cellLine!="MEF1p") %>%
+    group_by(seqnames, start, end, methyGroupFive, fidelity.score) %>%
+    summarise() %>%
+    mutate(yesno=1) %>%
+    spread(methyGroupFive, yesno, fill=0) %>%
+    ungroup() %>%
+    mutate(cpg.id = paste0(seqnames,":",start,"-",end), fidelity.score = as.character(fidelity.score)) %>%
+    select(-c(seqnames,start,end)) %>%
+    select(cpg.id, everything()) %>%
+    mutate(across(where(is.double), as.integer)) %>%
+    as.data.frame() %>%
+    mutate(fidelity.score = as.numeric(fidelity.score)) %>%
+    make_comb_mat()
+  MEF1_clones.methyGroup.list[[methyGroupFive.name]] <- MEF1_clones.methyGroup.mat
+}
+
+MEF1_clones.methyGroup.plot.list = NULL
+for(methyGroupFive.name in names(MEF1_clones.methyGroup.list)) {
+  mat =  MEF1_clones.methyGroup.list[[methyGroupFive.name]]
+  cs =  comb_size(mat)
+  new.cs =  tail(sort(cs), 5)
+  new.mat = mat[cs >= new.cs[1]]
+  new.new.cs =  comb_size(new.mat)
+  upset.plot <- UpSet(t(new.mat),
+                      set_order=c("[0,10]",  "(10,40]", "(40,60]", "(60,90]", "(90,100]"),
+                      comb_order=order(-new.new.cs))
+  MEF1_clones.methyGroup.plot.list = c(MEF1_clones.methyGroup.plot.list, list(upset.plot))
+} 
+
+
+
+
+png("MEF1_lowMethy_upset_plot.png", width=4, height=5, units="in", res=1200)
+MEF1_clones.methyGroup.plot.list[[5]]
+dev.off()
+
+png("MEF1_lowIntermediateMethy_upset_plot.png", width=4, height=5, units="in", res=1200)
+MEF1_clones.methyGroup.plot.list[[4]]
+dev.off()
+
+
+png("MEF1_intermediateMethy_upset_plot.png", width=4, height=5, units="in", res=1200)
+MEF1_clones.methyGroup.plot.list[[3]]
+dev.off()
+
+png("MEF1_highIntermediateMethy_upset_plot.png", width=4, height=5, units="in", res=1200)
+MEF1_clones.methyGroup.plot.list[[1]]
+dev.off()
+
+png("MEF1_highMethy_upset_plot.png", width=4, height=5, units="in", res=1200)
+MEF1_clones.methyGroup.plot.list[[2]]
+dev.off()
+
+#same as above, but for MEF2
+# Prepping list dfs with different parental methy states - already did this above for MEF1
+names.methyGroupFive.MEF2 <- c("(40,60]", "(90,100]",  "(10,40]", "(60,90]", "[0,10]")
+MEF2p.methyGroup.list <- gr.split.by.col(MEF_methy_cpg_tenx.gr_chrRemoved[MEF_methy_cpg_tenx.gr_chrRemoved$cellLine=="MEF2p"], "methyGroupFive")
+names(MEF2p.methyGroup.list) <- names.methyGroupFive.MEF2
+
+MEF2_clones.methyGroup.list <- list() 
+for(methyGroupFive.name in names(MEF2p.methyGroup.list)) {
+  MEF2p.methy <- MEF2p.methyGroup.list[[methyGroupFive.name]]
+  MEF2_clones.methyGroup.mat <- subsetByOverlaps(MEF_methy_cpg_tenx.gr_chrRemoved, MEF2p.methy) %>%
+    as.data.frame() %>%
+    filter(cellType=="MEF2", cellLine!="MEF2p") %>%
+    group_by(seqnames, start, end, methyGroupFive, fidelity.score) %>%
+    summarise() %>%
+    mutate(yesno=1) %>%
+    spread(methyGroupFive, yesno, fill=0) %>%
+    ungroup() %>%
+    mutate(cpg.id = paste0(seqnames,":",start,"-",end), fidelity.score = as.character(fidelity.score)) %>%
+    select(-c(seqnames,start,end)) %>%
+    select(cpg.id, everything()) %>%
+    mutate(across(where(is.double), as.integer)) %>%
+    as.data.frame() %>%
+    mutate(fidelity.score = as.numeric(fidelity.score)) %>%
+    make_comb_mat()
+  MEF2_clones.methyGroup.list[[methyGroupFive.name]] <- MEF2_clones.methyGroup.mat
+}
+
+
+MEF2_clones.methyGroup.plot.list = NULL
+for(methyGroupFive.name in names(MEF2_clones.methyGroup.list)) {
+  mat =  MEF2_clones.methyGroup.list[[methyGroupFive.name]]
+  cs =  comb_size(mat)
+  new.cs =  tail(sort(cs), 5)
+  new.mat = mat[cs >= new.cs[1]]
+  new.new.cs =  comb_size(new.mat)
+  upset.plot <- UpSet(t(new.mat),
+                      set_order=c("[0,10]",  "(10,40]", "(40,60]", "(60,90]", "(90,100]"),
+                      comb_order=order(-new.new.cs))
+  MEF2_clones.methyGroup.plot.list = c(MEF2_clones.methyGroup.plot.list, list(upset.plot))
+} 
+
+
+
+
+png("MEF2_lowMethy_upset_plot.png", width=4, height=5, units="in", res=1200)
+MEF2_clones.methyGroup.plot.list[[5]]
+dev.off()
+
+png("MEF2_lowIntermediateMethy_upset_plot.png", width=4, height=5, units="in", res=1200)
+MEF2_clones.methyGroup.plot.list[[4]]
+dev.off()
+
+
+png("MEF2_intermediateMethy_upset_plot.png", width=4, height=5, units="in", res=1200)
+MEF2_clones.methyGroup.plot.list[[3]]
+dev.off()
+
+png("MEF2_highIntermediateMethy_upset_plot.png", width=4, height=5, units="in", res=1200)
+MEF2_clones.methyGroup.plot.list[[1]]
+dev.off()
+
+png("MEF2_highMethy_upset_plot.png", width=4, height=5, units="in", res=1200)
+MEF2_clones.methyGroup.plot.list[[2]]
+dev.off()
+
+#EDITED ABOVE PLOTS IN ILLUSTRATOR
+
+
+```
+
+## Making simple clonal methylation distributions based on parental methylation state
+``` {r clonal.dist, message=FALSE}
+
+#Figure 4B and Extended Data Figure 9A
+
+set_size.df <- rbind(MEF1_clones.methyGroup.list$`[0,10]` %>% set_size(), 
+      MEF1_clones.methyGroup.list$`(10,40]` %>% set_size(),
+      MEF1_clones.methyGroup.list$`(40,60]` %>% set_size(),
+      MEF1_clones.methyGroup.list$`(60,90]` %>% set_size(),
+      MEF1_clones.methyGroup.list$`(90,100]` %>% set_size()) %>% as.data.frame()
+set_size.df$parentMethyGroupFive <- c("[0,10]", "(10,40]", "(40,60]", "(60,90]", "(90,100]")
+set_size.df <- set_size.df %>% pivot_longer(cols=c("[0,10]", "(10,40]", "(40,60]", "(60,90]", "(90,100]"), 
+                             names_to = "clonalMethyGroupFive", 
+                             values_to="set_size")
+set_size.df$clonalMethyGroupFive <- factor(set_size.df$clonalMethyGroupFive, levels=c("[0,10]", "(10,40]", "(40,60]", "(60,90]", "(90,100]"))
+set_size.df$parentMethyGroupFive <- factor(set_size.df$parentMethyGroupFive, levels=c("[0,10]", "(10,40]", "(40,60]", "(60,90]", "(90,100]"))
+
+set_size.plot <- set_size.df %>% 
+  ggplot() + 
+  geom_bar(aes(x=clonalMethyGroupFive, y=set_size), stat='identity') + 
+  facet_wrap(~parentMethyGroupFive, scales="free", nrow=1)
+
+set_size.mockDeterministic.df <- set_size.df %>% 
+  mutate(set_size = ifelse(clonalMethyGroupFive=="(10,40]" | clonalMethyGroupFive=="(60,90]", 0, set_size))
+
+set_size.mockDeterministic.plot <- set_size.mockDeterministic.df %>% 
+  ggplot() + 
+  geom_bar(aes(x=clonalMethyGroupFive, y=set_size), stat='identity') + 
+  facet_wrap(~parentMethyGroupFive, scales="free", nrow=1) + 
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+set_size.mockStochastic.df <- set_size.df %>% 
+  mutate(set_size = ifelse(parentMethyGroupFive!=clonalMethyGroupFive, 0, set_size))
+
+set_size.mockStochastic.plot <- set_size.mockStochastic.df %>% 
+  ggplot() + 
+  geom_bar(aes(x=clonalMethyGroupFive, y=set_size), stat='identity') + 
+  facet_wrap(~parentMethyGroupFive, scales="free", nrow=1) + 
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())      
+  
+set_size.mockDeterministic.plot / set_size.mockStochastic.plot / set_size.plot
+
+MEF1_clones.methy %>%  as.data.frame() %>% ggplot() + geom_bar(aes(x=methyGroupFive)) + facet_wrap(~parentMethyGroupFive, scales="free", nrow=1)
+
+clonal_methylation_dist_MEF1 <- as.data.frame(MEF1_clones.methy) %>%  
+    ggplot() + 
+    geom_histogram(aes(x=methyPercent), binwidth=5, center=2.5) + 
+    theme_minimal() + 
+    theme( 
+        panel.grid = element_blank(),
+        axis.line.y = element_line(size=0.5),
+        axis.line.x = element_line(size=0.5), 
+        text = element_text(size=16), 
+        axis.ticks = element_line(size=0.5),
+        legend.position="none",
+        strip.text = element_blank()
+    ) + 
+    scale_y_continuous(expand=c(0,0), labels=scales::scientific) +
+    scale_x_continuous(expand=c(0,0)) +
+    facet_wrap(~parentMethyGroupFive, scales="free", nrow=1) +
+    xlab("Clonal methylation (%)") +
+    ylab("Counts")
+
+ggsave("clonal_methylation_dist_MEF1.png", clonal_methylation_dist_MEF1, width=12, height=2)
+ggsave("clonal_methylation_dist_MEF1.pdf", clonal_methylation_dist_MEF1, width=12, height=2, useDingbats=FALSE)
+
+parental_methylation_dist_MEF1 <- MEF_methy_cpg_tenx.gr_chrRemoved %>% as.data.frame() %>% filter(cellLine=="MEF1p") %>% ggplot() + 
+    geom_histogram(aes(x=methyPercent), binwidth=5, center=2.5) + 
+    theme_minimal() + 
+    theme( 
+        panel.grid = element_blank(),
+        axis.line.y = element_line(size=0.5),
+        axis.line.x = element_line(size=0.5), 
+        text = element_text(size=16), 
+        axis.ticks = element_line(size=0.5),
+        legend.position="none",
+        strip.text = element_blank()
+    ) + 
+    scale_y_continuous(expand=c(0,0), labels=scales::scientific) +
+    scale_x_continuous(expand=c(0,0)) +
+    facet_wrap(~methyGroupFive, scales="free_y", nrow=1) +
+    xlab("Clonal methylation (%)") +
+    ylab("Counts")
+ggsave("parental_methylation_dist_MEF1.pdf", parental_methylation_dist_MEF1, width=12, height=2, useDingbats=FALSE)
+
+clonal_methylation_dist_MEF2 <- as.data.frame(MEF2_clones.methy) %>%  
+    ggplot() + 
+    geom_histogram(aes(x=methyPercent), binwidth=5, center=2.5) + 
+    theme_minimal() + 
+    theme( 
+        panel.grid = element_blank(),
+        axis.line.y = element_line(size=0.5),
+        axis.line.x = element_line(size=0.5), 
+        text = element_text(size=16), 
+        axis.ticks = element_line(size=0.5),
+        legend.position="none",
+        strip.text = element_blank()
+    ) + 
+    scale_y_continuous(expand=c(0,0), labels=scales::scientific) +
+    scale_x_continuous(expand=c(0,0)) +
+    facet_wrap(~parentMethyGroupFive, scales="free", nrow=1) +
+    xlab("Clonal methylation (%)") +
+    ylab("Counts")
+
+ggsave("clonal_methylation_dist_MEF2.png", clonal_methylation_dist_MEF2, width=12, height=2)
+ggsave("clonal_methylation_dist_MEF2.pdf", clonal_methylation_dist_MEF2, width=12, height=2, useDingbats=FALSE)
+
+parental_methylation_dist_MEF2 <- MEF_methy_cpg_tenx.gr_chrRemoved %>% as.data.frame() %>% filter(cellLine=="MEF2p") %>% ggplot() + 
+    geom_histogram(aes(x=methyPercent), binwidth=5, center=2.5) + 
+    theme_minimal() + 
+    theme( 
+        panel.grid = element_blank(),
+        axis.line.y = element_line(size=0.5),
+        axis.line.x = element_line(size=0.5), 
+        text = element_text(size=16), 
+        axis.ticks = element_line(size=0.5),
+        legend.position="none",
+        strip.text = element_blank()
+    ) + 
+    scale_y_continuous(expand=c(0,0), labels=scales::scientific) +
+    scale_x_continuous(expand=c(0,0)) +
+    facet_wrap(~methyGroupFive, scales="free_y", nrow=1) +
+    xlab("Clonal methylation (%)") +
+    ylab("Counts")
+ggsave("parental_methylation_dist_MEF2.pdf", parental_methylation_dist_MEF2, width=12, height=2, useDingbats=FALSE)
+
+
+```
+
+## Fold enrichment plots of "peak" datasets + stochastic / non-stochastic characterisation
+``` {r density.plots.peaks}
+
+# Extended Data Figure 10
+
+## work with Noah
+
+determine_methy_state <- function(p5, c5) {
+  p5 <- unique(p5)
+  c5 <- unique(c5)
+  
+  if (any(c("(10,40]","(60,90]") %in% c5))
+    return("Stochastic")
+  
+ # if (p5 %in% c("[0,10]", "(40,60]", "(90,100]") && length(c5)==1 && p5 == c5)
+#    return("Ambiguous")
+  
+  return("Non-stochastic")
+}
+
+MEF1_clones.methy.reduced <- MEF1_clones.methy %>% 
+  as.data.frame() %>% 
+  select(seqnames, start, end, methyGroupFive, parentMethyGroupFive) %>% 
+  distinct() %>%
+  group_by(seqnames, start, end, parentMethyGroupFive) %>%
+  summarize(methy_state = determine_methy_state(parentMethyGroupFive, methyGroupFive)) %>%
+  ungroup
+MEF1_clones.methy.reduced$cellType <- "MEF1"
+
+
+
+MEF2_clones.methy.reduced <- MEF2_clones.methy %>% 
+  as.data.frame() %>% 
+  select(seqnames, start, end, methyGroupFive, parentMethyGroupFive) %>% 
+  distinct() %>%
+  group_by(seqnames, start, end, parentMethyGroupFive) %>%
+  summarize(methy_state = determine_methy_state(parentMethyGroupFive, methyGroupFive)) %>%
+  ungroup
+MEF2_clones.methy.reduced$cellType <- "MEF2"
+
+
+#cov10
+stochastic.cov10 <- subsetByOverlaps(
+  MEF_methy_cpg_tenx.gr_chrRemoved, 
+  left_join(MEF1_clones.methy.reduced, MEF2_clones.methy.reduced, by=c("seqnames", "start", "end")) %>% 
+    filter(methy_state.x==methy_state.y) %>% 
+    filter(methy_state.x=="Stochastic") %>% 
+    GRanges()) %>% 
+  as.data.frame() %>% 
+  group_by(seqnames, start, end) %>% 
+  summarise()
+
+nonstochastic.cov10 <- subsetByOverlaps(MEF_methy_cpg_tenx.gr_chrRemoved, left_join(MEF1_clones.methy.reduced, MEF2_clones.methy.reduced, by=c("seqnames", "start", "end")) %>% filter(methy_state.x==methy_state.y) %>% group_by(methy_state.x) %>% filter(methy_state.x=="Non-stochastic") %>% GRanges()) %>% as.data.frame() %>% group_by(seqnames, start, end) %>% summarise()
+
+write.table(stochastic.cov10, "stochastic.cov10.bed", quote=F, row.names=F, col.names=F)
+write.table(nonstochastic.cov10, "nonstochastic.cov10.bed", quote=F, row.names=F, col.names=F)
+
+stochastic.cov10.overlaps <- findOverlaps(MEF_methy_cpg_tenx.gr_chrRemoved, stochastic.cov10 %>% GRanges())
+nonstochastic.cov10.overlaps <- findOverlaps(MEF_methy_cpg_tenx.gr_chrRemoved, nonstochastic.cov10 %>% GRanges())
+
+MEF_methy_cpg_tenx.gr_chrRemoved$stochastic <- NA
+MEF_methy_cpg_tenx.gr_chrRemoved[queryHits(stochastic.cov10.overlaps)]$stochastic <- "Stochastic" 
+MEF_methy_cpg_tenx.gr_chrRemoved[queryHits(nonstochastic.cov10.overlaps)]$stochastic <- "Non-stochastic" 
+
+
+# counts of stochastic and non-stochastic CpGs
+
+counts_stochastic.plot <- as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>%  
+  select(seqnames, start, end, stochastic) %>% 
+  distinct() %>% 
+  ggplot() + 
+  geom_bar(aes(x=stochastic), fill="black") +
+  theme_minimal() +
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+        text=element_text(colour="black", size=9),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5),
+        axis.text = element_text(angle=45, hjust=1, vjust=1)) +
+  scale_y_continuous(expand = c(0,0)) +
+  xlab("") +
+  ylab("Counts of CpGs") 
+
+ggsave("counts_stochastic.plot.pdf", counts_stochastic.plot, width=2, height=2)
+
+# methylation distributions of stochastic and non-stochastic CpGs
+
+methy_distributions_stochastic.plot <- as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>%  
+  filter(!isNA(stochastic)) %>% 
+  ggplot() + 
+  geom_histogram(aes(x=methyPercent), binwidth=2, center=1) +
+  facet_wrap(~stochastic, scales="free") +
+  theme_minimal() +
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+        axis.ticks.x = element_line(colour="black", size=0.5),
+        text=element_text(colour="black", size=9),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5)) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_x_continuous(expand = c(0,0)) +
+  xlab("Methylation (%)") +
+  ylab("Counts") 
+
+ggsave("methy_distributions_stochastic.plot.pdf", methy_distributions_stochastic.plot, width=4, height=1.5)
+
+
+# histone tail modification tables
+
+histone_mod_table.df <- NULL
+for(his in histone_mod_list){
+    table <- as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>% 
+    select(seqnames, start, end, stochastic, var=!!his) %>% 
+    distinct() %>% 
+    group_by(stochastic, var) %>% 
+    dplyr::count() %>% 
+    pivot_longer(var) %>%
+    group_by(stochastic, name) %>%
+    mutate(total_n = sum(n)) %>%
+    ungroup() %>%
+    filter(value==TRUE) %>%
+    mutate(ratio_his = n/total_n) %>%
+    filter(!isNA(stochastic)) %>% 
+    select(stochastic, n, name, ratio_his) %>%
+    pivot_wider(names_from = stochastic, values_from = c(n, ratio_his))
+    table[,"name"] <- his
+  histone_mod_table.df = rbind(histone_mod_table.df, table)
+}
+write.table(histone_mod_table.df, file='histone_mod_table.df.tsv', quote=FALSE, sep='\t')
+
+
+# histone tail modification fold enrichment plots
+
+histone_mod_list <- c("H3K4me3", "H3K9ac", "H3K27ac", "H3K27me3", "H3K9me3", "H3K36me3")
+
+
+histone_mod_FE.df <- NULL
+for(his in histone_mod_list){
+    FE <- as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>% 
+      select(seqnames, start, end, stochastic, var=!!his) %>% 
+      distinct() %>% 
+      group_by(stochastic, var) %>% 
+      dplyr::count() %>% 
+      pivot_longer(var) %>%
+      group_by(stochastic, name) %>%
+      mutate(total_n = sum(n)) %>%
+      ungroup() %>%
+      filter(value==TRUE) %>%
+      mutate(ratio_his = n/total_n) %>%
+      filter(!isNA(stochastic)) %>%
+      group_by(name) %>%
+      summarise(fold_enrichment = ratio_his[stochastic=="Stochastic"] / ratio_his[stochastic=="Non-stochastic"])
+    FE[,"name"] <- his
+  histone_mod_FE.df = rbind(histone_mod_FE.df, FE)
+}
+
+histone_mod_FE.df$name <- factor(histone_mod_FE.df$name, levels= c("H3K4me3", "H3K9ac", "H3K36me3","H3K27me3", "H3K9me3", "H3K27ac", "H3K4me1"))
+
+histone_mod_FE.plot <- histone_mod_FE.df %>% 
+  ggplot() + 
+  #geom_bar(aes(x=reorder(name, fold_enrichment), y=log2(fold_enrichment)), fill= "black", stat="identity") +
+  geom_bar(aes(x=name, y=log2(fold_enrichment)), fill= "black", stat="identity") +
+  theme_minimal() +
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+        text=element_text(colour="black", size=9),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5)) +
+  #scale_y_continuous(expand = c(0,0)) +
+  xlab("") +
+  ylab("Fold enrichment \n Stochastic / Non-stochastic \n (Log2)") 
+
+ggsave("histone_mod_FE.plot.pdf", histone_mod_FE.plot, width=4.5, height=2)
+
+#clarifying that the enrichment occurs against both non-stochastic unmethylated and non-stochastic methylated 
+
+MEF_methy_cpg_tenx.gr_chrRemoved$stochastic3 <- NA
+MEF_methy_cpg_tenx.gr_chrRemoved[!is.na(MEF_methy_cpg_tenx.gr_chrRemoved$stochastic) & MEF_methy_cpg_tenx.gr_chrRemoved$stochastic=="Stochastic"]$stochastic3 <- "Stochastic"
+MEF_methy_cpg_tenx.gr_chrRemoved[!is.na(MEF_methy_cpg_tenx.gr_chrRemoved$stochastic) & MEF_methy_cpg_tenx.gr_chrRemoved$stochastic=="Non-stochastic" & MEF_methy_cpg_tenx.gr_chrRemoved$methyPercent < 10]$stochastic3 <- "Non-stochastic (Unmethylated)"
+MEF_methy_cpg_tenx.gr_chrRemoved[!is.na(MEF_methy_cpg_tenx.gr_chrRemoved$stochastic) & MEF_methy_cpg_tenx.gr_chrRemoved$stochastic=="Non-stochastic" & MEF_methy_cpg_tenx.gr_chrRemoved$methyPercent > 90]$stochastic3 <- "Non-stochastic (Fully methylated)"
+
+# plot distributions of non-stochastic unmethy and methy
+
+MEF_methy_cpg_tenx.gr_chrRemoved$stochastic3 <- factor(MEF_methy_cpg_tenx.gr_chrRemoved$stochastic3, levels=c("Non-stochastic (Unmethylated)", "Non-stochastic (Fully methylated)", "Stochastic", NA))
+                                                       
+methy_distrbutions_stochastic3.plot <- as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>%  
+  filter(!isNA(stochastic3), stochastic3!="Stochastic") %>% 
+  ggplot() + 
+  geom_histogram(aes(x=methyPercent), binwidth=5, center=2.5) +
+  facet_wrap(~stochastic3) +
+  theme_minimal() +
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+        axis.ticks.x = element_line(colour="black", size=0.5),
+        text=element_text(colour="black", size=9),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5)) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_x_continuous(expand = c(0,0)) +
+  xlab("Methylation (%)") +
+  ylab("Counts") 
+
+ggsave("methy_distrbutions_stochastic3.plot.pdf", methy_distrbutions_stochastic3.plot, width=2, height=1.5)
+
+
+# plot fold enrichment of h3k27me3 and h3k9me3 against both non-stochastic unmethy and methy
+histone_mod_list.check <- c("H3K27me3", "H3K9me3")
+histone_mod_FE.unmethy.df <- NULL
+for(his in histone_mod_list.check){
+  FE <- as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>% 
+      select(seqnames, start, end, stochastic3, var=!!his) %>% 
+      distinct() %>% 
+      group_by(stochastic3, var) %>% 
+      dplyr::count() %>% 
+      pivot_longer(var) %>%
+      group_by(stochastic3, name) %>%
+      mutate(total_n = sum(n)) %>%
+      ungroup() %>%
+      filter(value==TRUE) %>%
+      mutate(ratio_his = n/total_n) %>%
+      filter(!isNA(stochastic3), stochastic3 != "Non-stochastic (Fully methylated)") %>%
+      group_by(name) %>%
+      summarise(fold_enrichment = ratio_his[stochastic3=="Stochastic"] / ratio_his[stochastic3=="Non-stochastic (Unmethylated)"])
+    FE[,"name"] <- his
+  histone_mod_FE.unmethy.df = rbind(histone_mod_FE.unmethy.df, FE)
+}
+histone_mod_FE.unmethy.df$methy_state_non_stochastic <- "unmethy"
+
+histone_mod_FE.methy.df <- NULL
+for(his in histone_mod_list.check){
+  FE <- as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>% 
+      select(seqnames, start, end, stochastic3, var=!!his) %>% 
+      distinct() %>% 
+      group_by(stochastic3, var) %>% 
+      dplyr::count() %>% 
+      pivot_longer(var) %>%
+      group_by(stochastic3, name) %>%
+      mutate(total_n = sum(n)) %>%
+      ungroup() %>%
+      filter(value==TRUE) %>%
+      mutate(ratio_his = n/total_n) %>%
+      filter(!isNA(stochastic3), stochastic3 != "Non-stochastic (Unmethylated)") %>%
+      group_by(name) %>%
+      summarise(fold_enrichment = ratio_his[stochastic3=="Stochastic"] / ratio_his[stochastic3=="Non-stochastic (Fully methylated)"])
+    FE[,"name"] <- his
+  histone_mod_FE.methy.df = rbind(histone_mod_FE.methy.df, FE)
+}
+histone_mod_FE.methy.df$methy_state_non_stochastic <- "methy"
+
+histone_mod_FE.combined.df <- rbind(histone_mod_FE.unmethy.df, histone_mod_FE.methy.df) 
+histone_mod_FE.combined.df$methy_state_non_stochastic <- factor(histone_mod_FE.combined.df$methy_state_non_stochastic, levels=c("unmethy", "methy"))
+histone_mod_FE.check.plot <- histone_mod_FE.combined.df %>% 
+  ggplot() + 
+  geom_bar(aes(x=reorder(name, fold_enrichment), y=log2(fold_enrichment)), fill="black",stat="identity") + 
+  facet_wrap(~methy_state_non_stochastic) +
+   theme_minimal() +
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+        text=element_text(colour="black", size=9),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5), 
+        axis.text.x = element_text(angle=45, hjust=1, vjust=1)) +
+  scale_y_continuous(expand = c(0,0)) +
+  xlab("") +
+  ylab("Fold enrichment \n Stochastic / Non-stochastic \n (Log2)") 
+ggsave("histone_mod_FE.check.plot.pdf", histone_mod_FE.check.plot, width=2, height=2)
+
+```
+
+
+## Prepping TE level data object
+``` {r TE.prep.data}
+
+make_df_for_element_plotting.TEs <- function(methy_data, region.gr, gene_overlap) {
+  methy_data_element <- subsetByOverlaps(methy_data, region.gr)
+  methy_data_element.overlap <- findOverlaps(methy_data_element, region.gr)
+  
+  methy_data_element$element.id <- NA
+  methy_data_element[queryHits(methy_data_element.overlap)]$element.id<- region.gr[subjectHits(methy_data_element.overlap)]$element.id
+  #methy_data_element$specific_type <- NA
+  #methy_data_element[queryHits(methy_data_element.overlap)]$specific_type<- region.gr[subjectHits(methy_data_element.overlap)]$specific_type
+  methy_data_element$type <- NA
+  methy_data_element[queryHits(methy_data_element.overlap)]$type<- region.gr[subjectHits(methy_data_element.overlap)]$type
+  #methy_data_element$alt_type_name <- NA
+  #methy_data_element[queryHits(methy_data_element.overlap)]$alt_type_name<- region.gr[subjectHits(methy_data_element.overlap)]$alt_type_name
+  if(gene_overlap=="WG_all") { 
+    methy_data_element <- methy_data_element %>% 
+      as.data.frame() %>% 
+      group_by(., cellLine, element.id, specific_type, type, alt_type_name)  %>% 
+      summarise(avg.methy.element = mean(methyPercent), 
+            var.methy.element = var(methyPercent, na.rm=TRUE), 
+            number.cpg.in.element = n()) %>% 
+      ungroup() %>%
+      filter(number.cpg.in.element > 2) # Thresholding number of CpGs per element
+  }
+  if(gene_overlap=="ESCs" | gene_overlap=="ESCs_in" | gene_overlap=="ESCs_out") { 
+    methy_data_element <- methy_data_element %>% 
+      as.data.frame() %>% 
+      group_by(., cellLine, element.id, specific_type, type, alt_type_name)  %>% 
+      summarise(avg.methy.element = mean(methyPercent), 
+            avg.fid.element = mean(fidelity.score), 
+            number.cpg.in.element = n()) %>% 
+      ungroup() %>%
+      filter(number.cpg.in.element > 2) # Thresholding number of CpGs per element
+  }
+  else {
+    methy_data_element <- methy_data_element %>% 
+      as.data.frame() %>% 
+      group_by(., cellLine, element.id, type 
+               #specific_type, , alt_type_name
+               )  %>% 
+      summarise(avg.methy.element = mean(methyPercent), 
+            var.methy.element = var(methyPercent, na.rm=TRUE), 
+            avg.fid.element = mean(fidelity.score), 
+            number.cpg.in.element = n()
+            #,
+            #avg.methy.diff.dnmt1KO.element = mean(avg.methy.diff.dnmt1KO),
+            #avg.methy.diff.dnmt3DKO.element = mean(avg.methy.diff.dnmt3DKO),
+            #avg.methy.diff.TTKO.element = mean(avg.methy.diff.TTKO)
+            ) %>% 
+      ungroup() %>%
+      filter(number.cpg.in.element > 2) # Thresholding number of CpGs per element
+  }
+  
+  methy_data_element$cellType <- substr(methy_data_element$cellLine, 1,4)
+  methy_data_element <- left_join(methy_data_element, as.data.frame(region.gr) %>% dplyr::select(seqnames, start, end, element.id)) %>%
+  GRanges()
+ 
+  # Adding expression data 
+  methy_data_element_gene.overlap <- findOverlaps(methy_data_element, unfiltered_genes.rlog.gr.fixed)
+  methy_data_element$avg.rlog <- NA
+  methy_data_element[queryHits(methy_data_element_gene.overlap)]$avg.rlog <- unfiltered_genes.rlog.gr[subjectHits(methy_data_element_gene.overlap)]$avg.rlog
+  methy_data_element$transcription.quintile <- NA
+  methy_data_element[queryHits(methy_data_element_gene.overlap)]$transcription.quintile <- unfiltered_genes.rlog.gr[subjectHits(methy_data_element_gene.overlap)]$transcription.quintile
+  
+
+  # Subsetting by intron overlap
+  methy_data_element.inside_gene <- subsetByOverlaps(methy_data_element, ensembl_introns.gr)
+  
+  # Vice-versa
+  methy_data_element.outside_gene <- subsetByOverlaps(methy_data_element, ensembl_introns.gr, invert=TRUE)
+
+  if(gene_overlap=="" | gene_overlap=="WG_all" | gene_overlap=="ESCs") { 
+  return(methy_data_element)
+  }
+  else if(gene_overlap=="in" | gene_overlap=="WG_in" | gene_overlap=="ESCs_in") { 
+  return(methy_data_element.inside_gene)
+  }
+  else if(gene_overlap=="out" | gene_overlap=="WG_out" | gene_overlap=="ESCs_out") { 
+  return(methy_data_element.outside_gene)
+  }
+}
+
+
+#
+
+TE.withStrand.df.list <- lapply(TE.withStrand, as.data.frame)
+for (name in names(TE.withStrand.df.list)) {
+  annotation <- TE.withStrand.df.list[[name]] %>% 
+    dplyr::select(seqnames, start, end, strand) %>% 
+    add_column(., dummy1=NA, .before="strand") %>% 
+    add_column(., dummy2=NA, .before="strand")
+  write_tsv(annotation, paste0(name,".bed"), col_names = FALSE) 
+}
+
+TEs.gr <- TE.withStrand.df.list %>% bind_rows() %>% mutate(element.id = paste0(seqnames, ":", start, "-", end)) %>% GRanges() 
+
+MEF.TEs.avgs.all.gr <- make_df_for_element_plotting.TEs(MEF_methy_cpg_tenx.gr_chrRemoved, TEs.gr, "")
+MEF.TEs.avgs.all.gr <- add_cellsample_info_for_plotting(MEF.TEs.avgs.all.gr, "MEFs")
+MEF.TEs.avgs.all.gr <-  add_peak_to_element(MEF.TEs.avgs.all.gr, list.peaks.gr)
+
+MEF.TEs.avgs.in_gene.gr <- make_df_for_element_plotting.TEs(MEF_methy_cpg_tenx.gr_chrRemoved, TEs.gr, "in")
+MEF.TEs.avgs.in_gene.gr <- add_cellsample_info_for_plotting(MEF.TEs.avgs.in_gene.gr, "MEFs")
+MEF.TEs.avgs.in_gene.gr <- add_peak_to_element(MEF.TEs.avgs.in_gene.gr, list.peaks.gr)
+
+MEF.TEs.avgs.out_gene.gr <- make_df_for_element_plotting.TEs(MEF_methy_cpg_tenx.gr_chrRemoved, TEs.gr, "out")
+MEF.TEs.avgs.out_gene.gr <- add_cellsample_info_for_plotting(MEF.TEs.avgs.out_gene.gr, "MEFs")
+MEF.TEs.avgs.out_gene.gr <- add_peak_to_element(MEF.TEs.avgs.out_gene.gr, list.peaks.gr)
+
+MEF.TEs.avgs.out_gene.promoter.gr <- subsetByOverlaps(MEF.TEs.avgs.out_gene.promoter.gr, MEF.TEs.avgs.promoters.gr, invert=TRUE)
+
+MEF.TEs.avgs.promoters.gr <- subsetByOverlaps(MEF.TEs.avgs.all.gr, MEF.promoters.avgs.gr)
+MEF.TEs.promoters.overlaps <- findOverlaps(MEF.TEs.avgs.promoters.gr, MEF.promoters.avgs.gr)
+MEF.TEs.avgs.promoters.gr[queryHits(MEF.TEs.promoters.overlaps)]$avg.rlog <- MEF.promoters.avgs.gr[subjectHits(MEF.TEs.promoters.overlaps)]$avg.rlog
+
+#
+repetitive.named.gr <- as.data.frame(repetitive.named.gr) %>% 
+  mutate(element.id = paste0(seqnames, ":", start, "-", end)) %>%
+  GRanges()
+
+MEF.repetitive.avgs.all.gr <- make_df_for_element_plotting.TEs(MEF_methy_cpg_tenx.gr_chrRemoved, repetitive.named.gr, "")
+
+#
+# Prep MEF TE data
+
+TE.intron.overlap <- findOverlaps(MEF.TEs.avgs.all.gr, ensembl_introns.gr)
+MEF.TEs.avgs.all.gr$intronic <- FALSE
+MEF.TEs.avgs.all.gr[queryHits(TE.intron.overlap)]$intronic <- TRUE
+TE.promoter.overlap <- findOverlaps(MEF.TEs.avgs.all.gr, ensembl_promoter.protein_coding.gr)
+MEF.TEs.avgs.all.gr$promoter <- FALSE
+MEF.TEs.avgs.all.gr[queryHits(TE.promoter.overlap)]$promoter <- TRUE
+
+MEF.TEs.avgs.all.gr$regionType <- "intergenic"
+MEF.TEs.avgs.all.gr[MEF.TEs.avgs.all.gr$intronic==TRUE]$regionType <- "intronic"
+MEF.TEs.avgs.all.gr[MEF.TEs.avgs.all.gr$promoter==TRUE]$regionType <- "promoter"
+
+# same as above for all TEs
+
+TE.intron.overlap <- findOverlaps(TEs.gr, ensembl_introns.gr)
+TEs.gr$intronic <- FALSE
+TEs.gr[queryHits(TE.intron.overlap)]$intronic <- TRUE
+TE.promoter.overlap <- findOverlaps(TEs.gr, ensembl_promoter.protein_coding.gr)
+TEs.gr$promoter <- FALSE
+TEs.gr[queryHits(TE.promoter.overlap)]$promoter <- TRUE
+
+TEs.gr$regionType <- "intergenic"
+TEs.gr[TEs.gr$intronic==TRUE]$regionType <- "intronic"
+TEs.gr[TEs.gr$promoter==TRUE]$regionType <- "promoter"
+
+TEs.regionType.tc.df <- MEF.TEs.avgs.all.gr %>% 
+  as.data.frame() %>%
+  group_by(element.id, type, regionType) %>% 
+  summarise() %>% group_by(type, regionType) %>% 
+  dplyr::count() 
+TEs.regionType.tc.df$dataset <- "tc"
+
+TEs.regionType.wg.df <- TEs.gr %>% 
+  as.data.frame() %>%
+  group_by(element.id, type, regionType) %>% 
+  summarise() %>% group_by(type, regionType) %>% 
+  dplyr::count() 
+TEs.regionType.wg.df$dataset <- "wg"
+
+TEs.regionType.plot <- rbind(TEs.regionType.tc.df, TEs.regionType.wg.df) %>% 
+    ggplot() + 
+    geom_bar(aes(y=n, x=factor(type,levels=c("SINE", "LINE","LTR", "DNA")), fill=regionType), stat='identity', pos="fill") + 
+    facet_wrap(~dataset) + 
+    theme_minimal() + 
+    theme(
+        text = element_text(size=9.5), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(size=1, colour = "black"),
+        #axis.text.x = element_blank(),
+        legend.title = element_blank(), 
+        legend.position = "none", 
+        axis.ticks = element_line(size=1)) + 
+    xlab("") +
+    ylab("Proportion of TE type")
+
+ggsave("TEs.regionType.plot.pdf", TEs.regionType.plot, width=3.5, height=2)
+# Prep MEF repetitive data
+
+repetitive.intron.overlap <- findOverlaps(MEF.repetitive.avgs.all.gr, ensembl_introns.gr)
+MEF.repetitive.avgs.all.gr$intronic <- FALSE
+MEF.repetitive.avgs.all.gr[queryHits(repetitive.intron.overlap)]$intronic <- TRUE
+repetitive.promoter.overlap <- findOverlaps(MEF.repetitive.avgs.all.gr, ensembl_promoter.protein_coding.gr)
+MEF.repetitive.avgs.all.gr$promoter <- FALSE
+MEF.repetitive.avgs.all.gr[queryHits(repetitive.promoter.overlap)]$promoter <- TRUE
+
+MEF.repetitive.avgs.all.gr$regionType <- "intergenic"
+MEF.repetitive.avgs.all.gr[MEF.repetitive.avgs.all.gr$intronic==TRUE]$regionType <- "intronic"
+MEF.repetitive.avgs.all.gr[MEF.repetitive.avgs.all.gr$promoter==TRUE]$regionType <- "promoter"
+
+```
+
+
+## Genome-context TE analysis
+``` {r genomeContext.TE}
+
+
+# Figure 3C and D
+
+
+TEs_repetitive.df <- bind_rows(as.data.frame(MEF.TEs.avgs.all.gr), as.data.frame(MEF.repetitive.avgs.all.gr))
+
+TEs_repetitive.df$type <- factor(TEs_repetitive.df$type, levels=c("SINE", "LINE", "LTR", "DNA", "satellite","low_complexity", "simple_repeat"), labels=c("SINEs", "LINEs", "LTRs", "DNA TEs", "Satellite DNA", "Low complexity", "Simple repeats")) 
+TEs_repetitive.df$regionType <- factor(TEs_repetitive.df$regionType, levels=c("promoter", "intronic", "intergenic"), labels=c("promoter", "intronic", "intergenic")) 
+
+# Make boxplots
+
+TEs_repetitive_regionType.methy.slim.boxplot <-  TEs_repetitive.df %>% 
+    filter(!(type %in% c("Satellite DNA", "Low complexity", "Simple repeats"))) %>%
+    ggplot() +
+    geom_boxplot(aes(y=avg.methy.element, x=regionType, color=regionType))  +
+    facet_wrap(~type, nrow=1) +
+    theme_minimal() + 
+    theme(
+        text = element_text(size=9.5), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(size=1, colour = "black"),
+        axis.text.x = element_blank(),
+        legend.title = element_blank(), 
+        legend.position = "none", 
+        axis.ticks.y = element_line(size=1)) + 
+    xlab("") +
+    ylab("Methylation (%)") +
+    scale_colour_hue(direction=-1)
+
+TEs_repetitive_regionType.fid.slim.boxplot <- TEs_repetitive.df %>% 
+    filter(!(type %in% c("Satellite DNA", "Low complexity", "Simple repeats"))) %>%
+    ggplot() +
+    geom_boxplot(aes(y=avg.fid.element, x=regionType, color=regionType))  +
+    facet_wrap(~type, nrow=1) +
+    theme_minimal() + 
+    theme(
+        text = element_text(size=9.5), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(size=1, colour = "black"),
+        axis.text.x = element_blank(),
+        legend.title = element_blank(),
+        axis.ticks.y = element_line(size=1)) + 
+    xlab("") +
+    ylab("Fidelity score") +
+    ylim(0.6, 1) +
+    scale_colour_hue(direction=-1)
+
+
+combined.TE.transcription.boxplots <- TEs_repetitive_regionType.methy.slim.boxplot / TEs_repetitive_regionType.fid.slim.boxplot
+ggsave("combined.TE.transcription.boxplots.png", combined.TE.transcription.boxplots, width=4.5, height=3)
+ggsave("combined.TE.transcription.boxplots.pdf", combined.TE.transcription.boxplots, width=4.5, height=4, useDingbats=FALSE)
+
+ggsave("combined.TE.transcription.boxplots.pdf", combined.TE.transcription.boxplots, width=4.5, height=3, useDingbats=FALSE)
+ggsave("TE.genomic.fidelity.pdf", TEs_repetitive_regionType.fid.slim.boxplot, width=4.5, height=2, useDingbats=FALSE)
+
+
+```
+
+# this does not belong here!!
+unfiltered_genes.rlog.DKO.gr.DIFF <- as.data.frame(unfiltered_genes.rlog.DKO.gr) %>%  
+  pivot_wider(names_from = type, values_from = value) %>%  
+  select(!c(treatment, strand, width, gene_length, gene_id, gene_biotype, cellLine, avg.rlog, transcription.quintile)) %>% 
+  group_by(cellType, seqnames, start, end) %>% 
+  summarise_all(mean, na.rm=T) %>% 
+  mutate(diff_expression = ) %>%
+  ungroup()
+
+
+#DKO experiment
+## Load data
+``` {r DKO.tcBSseq}
+
+# Figure 5
+
+list_of_samples_DKO <- list(
+  b_cont = "/data/amir/dnmt3a3bDKO/tcBS_seq/methy/CpG_combine_SLX-20416.SXTA01.HG7FNDRX2.s_1.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  c_cont = "/data/amir/dnmt3a3bDKO/tcBS_seq/methy/CpG_combine_SLX-20416.SXTB01.HG7FNDRX2.s_1.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  e_cont = "/data/amir/dnmt3a3bDKO/tcBS_seq/methy/CpG_combine_SLX-20416.SXTC01.HG7FNDRX2.s_1.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  f_cont = "/data/amir/dnmt3a3bDKO/tcBS_seq/methy/CpG_combine_SLX-20416.SXTD01.HG7FNDRX2.s_1.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  b_DKO = "/data/amir/dnmt3a3bDKO/tcBS_seq/methy/CpG_combine_SLX-20416.SXTE01.HG7FNDRX2.s_1.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  c_DKO = "/data/amir/dnmt3a3bDKO/tcBS_seq/methy/CpG_combine_SLX-20416.SXTF01.HG7FNDRX2.s_1.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  e_DKO = "/data/amir/dnmt3a3bDKO/tcBS_seq/methy/CpG_combine_SLX-20416.SXTG01.HG7FNDRX2.s_1.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt",
+  f_DKO = "/data/amir/dnmt3a3bDKO/tcBS_seq/methy/CpG_combine_SLX-20416.SXTH01.HG7FNDRX2.s_1.r_1_val_1_bismark_bt2_pe.mqual_ge10.txt"
+)
+
+
+## Read in files using function and list above
+
+all_DKO_methy_data <- lapply(list_of_samples_DKO, read_in_SureSelectMethyl)
+
+## Make long data frame of the GRanges
+
+namecol <- rep(names(all_DKO_methy_data), unlist(lapply(all_DKO_methy_data, length)))
+all_DKO_methy_data <- unlist(GRangesList(all_DKO_methy_data))
+all_DKO_methy_data$cellLine <- namecol
+all_DKO_methy_data$cellType <- substr(all_DKO_methy_data$cellLine, 1,1)
+all_DKO_methy_data$treatment <- gsub(".*[_]([^.]+)", "\\1", all_DKO_methy_data$cellLine)
+names(all_DKO_methy_data) <- NULL
+all_DKO_methy_data.df <- as.data.frame(all_DKO_methy_data)
+rm(all_DKO_methy_data)
+rm(namecol)
+gc()
+
+#Threshold methy data by ≥10x coverage for all datasets 
+seqs_to_keep.DKO <- paste0("chr",c(1:19))
+all_DKO_methy_data.df <- all_DKO_methy_data.df %>% filter(seqnames %in% seqs_to_keep.DKO) %>% GRanges()
+
+cpg_tenx_all_DKO_datasets <- threshold_10x_cov(all_DKO_methy_data.df)
+all_DKO_methy_data.tenx.df <- inner_join(all_DKO_methy_data.df,cpg_tenx_all_DKO_datasets)
+
+cpg_50x_all_DKO_datasets <- threshold_50x_cov(all_DKO_methy_data.df)
+all_DKO_methy_data.50x.df <- inner_join(all_DKO_methy_data.df,cpg_50x_all_DKO_datasets)
+
+
+#making basic methylation states 
+all_DKO_methy_data.tenx.df$basic_methy_range <- ifelse(all_DKO_methy_data.tenx.df$methyPercent <= 10, '[0, 10]',
+                                                                ifelse(all_DKO_methy_data.tenx.df$methyPercent > 10 & all_DKO_methy_data.tenx.df$methyPercent < 90, '(10, 90)',
+                                                                       ifelse(all_DKO_methy_data.tenx.df$methyPercent >= 90, '[90, 100]', NA))) 
+
+all_DKO_methy_data.tenx.df.cont <- all_DKO_methy_data.tenx.df %>% as.data.frame() %>% filter(treatment=="cont")
+
+all_DKO_methy_data.tenx.df.cont <- all_DKO_methy_data.tenx.df.cont %>% 
+  as.data.frame() %>% 
+  group_by(seqnames, start, end,basic_methy_range) %>% 
+  mutate(n.range=n()) %>% 
+  filter(n.range==4) %>%
+  ungroup() %>% 
+  GRanges()
+
+determine_basic_methy_state.dko <- function(basic_methy_range) {
+  basic_methy_range <- unique(basic_methy_range)
+  if (any(c("(10, 90)") %in% basic_methy_range))
+    return("Intermediate")
+  if (all(c("[0, 10]") %in% basic_methy_range))
+    return("Low")
+  if (all(c("[90, 100]") %in% basic_methy_range))
+    return("High")
+  else
+    return(NA)
+}
+
+DKO.gr.WT.basic_methy_states <- all_DKO_methy_data.tenx.df.cont %>% 
+  as.data.frame() %>% 
+  group_by(seqnames, start, end) %>%
+  summarize(basic_methy_state = determine_basic_methy_state.dko(basic_methy_range)) %>%
+  ungroup() %>% 
+  GRanges()
+
+all_DKO_methy_data.tenx.df <- all_DKO_methy_data.tenx.df %>% GRanges()
+
+methy_DKO.basic_methy_state.overlap <- findOverlaps(all_DKO_methy_data.tenx.df, DKO.gr.WT.basic_methy_states)
+
+all_DKO_methy_data.tenx.df$basic_methy_state <- NA
+all_DKO_methy_data.tenx.df[queryHits(methy_DKO.basic_methy_state.overlap)]$basic_methy_state <- 
+  DKO.gr.WT.basic_methy_states[subjectHits(methy_DKO.basic_methy_state.overlap)]$basic_methy_state
+
+all_DKO_methy_data.tenx.df$basic_methy_state <- factor(all_DKO_methy_data.tenx.df$basic_methy_state, levels=c("Low", "Intermediate", "High"))
+
+all_DKO_methy_data.tenx.df.diffMethy <- as.data.frame(all_DKO_methy_data.tenx.df) %>% 
+    group_by(seqnames, start, end, treatment, basic_methy_state) %>% 
+    summarise(meanMethyPercent = mean(methyPercent)) %>% 
+    pivot_wider(names_from = treatment, values_from = meanMethyPercent) %>% 
+    mutate(diffMethy = DKO - cont) 
+
+all_DKO_methy_data.tenx.df.diffMethy %>% 
+  ggplot() + 
+  geom_hline(yintercept=0, linetype="dashed", color = "black") +
+  geom_boxplot(aes(x=basic_methy_state, y=diffMethy, fill=basic_methy_state)) +
+  theme_minimal() +
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+        text=element_text(colour="black", size=7),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5),
+        legend.position = "none") +
+  scale_fill_manual(values=c("#CE1B1E", "#FDF2A6", "#3A62A6")) +
+  xlab("Methylation state") +
+  ylab("Avg. difference in methylation \n (DKO - cont)") 
+
+as.data.frame(all_DKO_methy_data.tenx.df) %>% 
+  ggplot() + 
+  geom_histogram(aes(x=methyPercent), binwidth=5, center=2.5) + 
+  facet_wrap(treatment~basic_methy_state, scales="free_y", nrow=2)
+
+
+# K means clustering the data
+all_DKO_methy_data.tenx.df.matrix <- cpg.df_to_cpg.matrixFormat(as.data.frame(all_DKO_methy_data.tenx.df)) %>% as.matrix()
+all_DKO_methy_data.tenx.df.matrix.Ks <-  sapply(2:20, function(i) summary(silhouette(clara(all_DKO_methy_data.tenx.df.matrix,k=i)))$avg.width)
+avg_silhouette_plot.DKO <- plot(2:20, all_DKO_methy_data.tenx.df.matrix.Ks, xlab="k", ylab="Average silhouette values", type="b", pch=19)
+all_DKO_methy_data.tenx.df.matrix.clara <- cluster::clara(all_DKO_methy_data.tenx.df.matrix, k=5)
+
+
+## Add all information to CpG GRanges object
+
+all_DKO_methy_data.tenx.df <- add_clusters_to_cpgs(all_DKO_methy_data.tenx.df, all_DKO_methy_data.tenx.df.matrix.clara)
+all_DKO_methy_data.tenx.df$cluster <- factor(all_DKO_methy_data.tenx.df$cluster, levels=c(5,3,1,4,2))
+all_DKO_methy_data.tenx.df$treatment <- factor(all_DKO_methy_data.tenx.df$treatment, levels=c("cont", "DKO"))
+
+all_DKO_methy_data.tenx.df %>% 
+    as.data.frame() %>% 
+    ggplot() +
+    geom_histogram(aes(x=methyPercent), binwidth=2, center=1) +
+    facet_wrap(treatment~cluster, nrow=2, scales="free_y")
+
+
+plot_heatmap_methy.DKO <- function(methy_data) {
+  methy_data %>% 
+    as.data.frame() %>% 
+    dplyr::select(seqnames, start, end, methyPercent, cellLine, cellType, cluster, treatment) %>% 
+    mutate(cpg=paste(seqnames, start, sep=":")) %>% 
+    mutate(cpg=paste(cpg, end, sep="-")) %>%
+    dplyr::select(cpg, methyPercent, cellLine, cellType, cluster, treatment) %>%
+    mutate(cpg = fct_reorder(cpg, methyPercent, .fun='median')) %>%
+    ggplot(aes(x=cellLine,y=cpg,fill=methyPercent)) +
+    geom_tile() +
+    scale_fill_gradientn(colours=c("#d73027", "#ffffbf","#4575b4"), guide = guide_colourbar(title = "Methylation (%)"), , breaks = c(0,50,100), labels=c("0","50","100")) +
+    #facet_grid(vars(factor(cluster, levels=c(4, 2, 1, 3, 5))), vars(treatment), space="free", scales="free") +
+    facet_grid(vars(1), vars(treatment), space="free", scales="free") +
+    theme_minimal() +
+    theme(axis.text.y=element_blank(),
+          axis.title.y=element_blank(),
+          text=element_text(size=45),
+          legend.position = "bottom",
+          legend.key.size = unit(2, "cm"),
+          strip.text = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          strip.background = element_blank(),
+          panel.border = element_blank(),
+          axis.line.y.left = element_blank()
+          ) +
+    xlab("")
+}
+
+DKO_methy.heatmap <- plot_heatmap_methy.DKO(all_DKO_methy_data.tenx.df)
+ggsave("DKO_methy.heatmap.noClusters.png",DKO_methy.heatmap, width=30, height=30, limitsize=F)
+
+
+all_DKO_methy_data.tenx.df.diffMethy.clusters <- as.data.frame(all_DKO_methy_data.tenx.df) %>% 
+    group_by(seqnames, start, end, treatment, cluster) %>% 
+    summarise(meanMethyPercent = mean(methyPercent)) %>% 
+    pivot_wider(names_from = treatment, values_from = meanMethyPercent) %>% 
+    mutate(diffMethy = DKO - cont) %>%
+  ungroup()
+
+all_DKO_methy_data.wide$cluster <- factor(all_DKO_methy_data.wide$cluster, levels=c(5,3,1,2,4), labels=c("Low", "Intermediate","Intermediate","Intermediate", "High"))
+
+all_DKO_methy_data.tenx.df.diffMethy.clusters$cluster <- factor(all_DKO_methy_data.tenx.df.diffMethy.clusters$cluster, levels=c(5,3,1,2,4), labels=c("Low", "Intermediate","Intermediate","Intermediate", "High"))
+
+all_DKO_methy_data.tenx.df.diffMethy.cluters.boxplot <- all_DKO_methy_data.tenx.df.diffMethy.clusters %>% ungroup() %>%
+  ggplot() + 
+  geom_vline(xintercept=0, linetype="dashed", color = "black") +
+  geom_boxplot(aes(y=cluster, x=diffMethy, fill=cluster)) +
+  theme_minimal() +
+  theme(axis.ticks = element_line(colour="black", size=0.5),
+        text=element_text(colour="black", size=7),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5),
+        legend.position = "none") +
+  scale_fill_manual(values=c("#CE1B1E", "#FDF2A6", "#3A62A6")) +
+  ylab("Methylation state") +
+  xlab("Avg. difference in methylation \n (DKO - cont)") 
+
+ggsave("all_DKO_methy_data.tenx.df.diffMethy.cluters.boxplot.pdf", all_DKO_methy_data.tenx.df.diffMethy.cluters.boxplot, height=2, width=4)
+
+
+
+all_DKO_methy_data.tenx.df$clusterNamed <- factor(all_DKO_methy_data.tenx.df$cluster, levels=c(4,2,1,3,5), labels=c("High", "Intermediate","Intermediate","Intermediate", "Low"))
+
+
+DKO.methyDist.plot <- as.data.frame(all_DKO_methy_data.tenx.df) %>% 
+  ggplot() + 
+  geom_histogram(aes(x=methyPercent, fill=clusterNamed, group=clusterNamed), center=1, binwidth =2) +
+  coord_cartesian(xlim=c(0, 100)) +
+  theme_minimal() + 
+  theme(axis.ticks.y = element_line(colour="black", size=0.5),
+        axis.ticks.x = element_line(colour="black", size=0.5),
+        text=element_text(colour="black", size=7),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color="black", size=0.5),
+        strip.text.x = element_blank(),
+        legend.key.size = unit(0.2, "cm")) +
+  scale_y_continuous(expand = c(0,0), labels=scales::scientific) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_fill_manual(values=c("#3A62A6","#FDF2A6","#CE1B1E")) +
+  xlab("Methylation (%)") +
+  ylab("CpG counts") +
+  facet_wrap(treatment~clusterNamed, ncol=1, scales="free")
+ggsave("DKO.methyDist.plot.pdf", DKO.methyDist.plot, height=4, width=2.5)
+
+```
+##
+
+
+``` {r imprint.testing}
+
+imprints.gr <- as.data.frame(imprints) %>% 
+  mutate(element.id=paste(seqnames, start, sep=":")) %>% 
+  mutate(element.id=paste(element.id, end, sep="-")) %>%
+  GRanges()
+
+MEF_methy_cpg_tenx.gr_chrRemoved$stochastic_imprint <- MEF_methy_cpg_tenx.gr_chrRemoved$stochastic
+MEF_methy_cpg_tenx.gr_chrRemoved[queryHits(findOverlaps(MEF_methy_cpg_tenx.gr_chrRemoved, imprints))]$stochastic_imprint <- imprint
+
+as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>%
+  filter(!is.na(stochastic_imprint)) %>%
+  ggplot() +
+  geom_boxplot(aes(x=stochastic_imprint, y=fidelity.score)) +
+  xlab("Type of CpG") +
+  scale_x_discrete(labels = c("Imprint", "Faithful", "Probabilistic"))
+
+as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>%
+  filter(!is.na(stochastic_imprint)) %>%
+  ggplot() +
+  geom_boxplot(aes(x=stochastic_imprint, y=neighbor.similarity.score)) +
+  xlab("Type of CpG") +
+  scale_x_discrete(labels = c("Imprint", "Faithful", "Probabilistic"))
+  
+
+```
+
+``` {r representation.cpgs.genome.tcBS-seq}
+#For Extended Data Table 1
+
+# CpG islands
+subsetByOverlaps(mm10CpG.fixed, cpgIslands.gr)
+subsetByOverlaps(MEF.cluster.cpgs, cpgIslands.gr)
+
+# genic regions 
+subsetByOverlaps(mm10CpG.fixed, gencode_promoter.gr)
+subsetByOverlaps(MEF.cluster.cpgs, gencode_promoter.gr)
+
+subsetByOverlaps(mm10CpG.fixed, gencode_exons.gr)
+subsetByOverlaps(MEF.cluster.cpgs, gencode_exons.gr)
+
+subsetByOverlaps(mm10CpG.fixed, gencode_introns.gr)
+subsetByOverlaps(MEF.cluster.cpgs, gencode_introns.gr)
+
+
+# TEs
+
+subsetByOverlaps(mm10CpG.fixed, TE.withStrand$SINEs)
+subsetByOverlaps(MEF.cluster.cpgs, TE.withStrand$SINEs)
+
+subsetByOverlaps(mm10CpG.fixed, TE.withStrand$LINEs)
+subsetByOverlaps(MEF.cluster.cpgs, TE.withStrand$LINEs)
+
+subsetByOverlaps(mm10CpG.fixed, TE.withStrand$LTRs)
+subsetByOverlaps(MEF.cluster.cpgs, TE.withStrand$LTRs)
+
+subsetByOverlaps(mm10CpG.fixed, TE.withStrand$DNA)
+subsetByOverlaps(MEF.cluster.cpgs, TE.withStrand$DNA)
+
+
+# Repliseq
+
+subsetByOverlaps(mm10CpG.fixed, repliseq_MEFs.gr[repliseq_MEFs.gr$repli_stage == "Early"])
+subsetByOverlaps(MEF.cluster.cpgs, repliseq_MEFs.gr[repliseq_MEFs.gr$repli_stage == "Early"])
+
+subsetByOverlaps(mm10CpG.fixed, repliseq_MEFs.gr[repliseq_MEFs.gr$repli_stage == "Late"])
+subsetByOverlaps(MEF.cluster.cpgs, repliseq_MEFs.gr[repliseq_MEFs.gr$repli_stage == "Late"])
+```
+
+## Saving data to file
+``` {r save.methy.data}
+saveRDS(as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>%
+  select(seqnames, start, end, coverage, unmethy, methy, methyPercent, cellLine, cellType, fidelity.score, neighbor.similarity.score, cpgCounts.100bp, basic.region.type), file = "methy_data_for_collab/MEF_methy_data.slim.Rda")
+
+write_tsv(as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>%
+  select(seqnames, start, end, coverage, unmethy, methy, methyPercent, cellLine, cellType, fidelity.score, neighbor.similarity.score, cpgCounts.100bp, basic.region.type), "methy_data_for_collab/MEF_methy_data.slim.tsv")
+
+saveRDS(as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved), file = "methy_data_for_collab/MEF_methy_data.full.Rda")
+
+write_tsv(as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved), "methy_data_for_collab/MEF_methy_data.full.tsv")
+
+write_tsv(as.data.frame(rlog.genes.unfiltered.gr), "rlog.genes.unfiltered.tsv")
+
+write_tsv(as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>%
+  select(seqnames, start, end, coverage, unmethy, methy, methyPercent, cellLine, cellType, cluster, fidelity.score, neighbor.similarity.score, cpgCounts.100bp, basic.region.type), "methy_data_for_collab/MEF_methy_data.slim.withClusters.tsv")
+
+write_tsv(as.data.frame(MEF_methy_cpg_tenx.gr_chrRemoved) %>%
+  select(seqnames, start, end, coverage, unmethy, methy, methyPercent, cellLine, cellType, fidelity.score, neighbor.similarity.score, cpgCounts.100bp, basic.region.type, methyGroupFive), "methy_data_for_collab/MEF_methy_data.slim.withMethyQuintiles.tsv")
+
+dds.cellLine.df.thresholded.M.df <- as.data.frame(dds.cellLine.df.thresholded.M)
+dds.cellLine.df.thresholded.M.df$gene_id <- rownames(dds.cellLine.df.thresholded.M.df)
+write_tsv(dds.cellLine.df.thresholded.M.df, "methy_data_for_collab/dds.cellLine.df.thresholded.M.tsv") 
+
+rna_seq.counts.df <- assays(dds)$counts %>% as.data.frame()
+rna_seq.counts.df <- rna_seq.counts.df %>% rownames_to_column("gene_id")
+write_tsv(rna_seq.counts.df, "methy_data_for_collab/rna_seq.counts.tsv")
+
+# saving RNA-seq SALMON for GEO submission
+
+write_tsv(rlog.genes.unfiltered.gr, "/data/amir/GEO_submissions/GEO_submission_RNA-seq_clonal_MEFs/all_clonal_MEF_gene_expression_data.tsv")        
+             
+
+```
